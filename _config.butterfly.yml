@@ -1,0 +1,541 @@
+# ======================================
+# Butterfly 主题配置 — YG
+# 文档: https://butterfly.js.org/
+# 格式: 冒号后一个空格，缩进用两个空格
+# 注意: 修改后需要重启 hexo server 才能看到效果
+# ======================================
+
+# --------------------------------------
+# 导航栏设置
+# --------------------------------------
+nav:
+  # 导航栏左侧的 logo 图片，填图片路径，留空则无 logo
+  logo:
+  # 是否在导航栏显示站点标题（_config.yml 里的 title）
+  display_title: true
+  # 是否在导航栏显示当前文章标题（向上滚动时出现）
+  display_post_title: true
+  # 是否固定导航栏（始终在顶部，不随滚动消失）
+  fixed: false
+
+# 菜单项配置
+# 格式: 菜单名: 链接 || 图标
+# 图标来自 Font Awesome (https://fontawesome.com/icons)
+# 以 / 结尾的链接会自动匹配当前路径高亮
+menu:
+  # 首页
+  Home: / || fas fa-home
+  # 归档页
+  Archives: /archives/ || fas fa-archive
+  # 标签页
+  Tags: /tags/ || fas fa-tags
+  # 分类页
+  Categories: /categories/ || fas fa-folder-open
+  # 关于页（当前被注释掉，需要时取消 # 即可）
+  # 注意: 要先执行 npx hexo new page "about" 创建页面
+  # About: /about/ || fas fa-heart
+
+# --------------------------------------
+# 代码块设置
+# --------------------------------------
+code_blocks:
+  # 代码高亮主题: darker / pale night / light / ocean / false(关闭)
+  theme: light
+  # 是否显示 Mac 风格的代码块（三个圆点）
+  macStyle: true
+  # 代码块高度限制（单位 px），false 则为不限制
+  height_limit: false
+  # 是否允许代码自动换行（false 则出现横向滚动条）
+  word_wrap: false
+  # 是否显示复制按钮
+  copy: true
+  # 是否显示代码语言标签
+  language: true
+  # 代码块是否默认收起: true 默认收起 | false 默认展开 | none 展开且隐藏按钮
+  shrink: false
+  # 是否允许代码块全屏查看
+  fullpage: false
+
+# --------------------------------------
+# 社交链接（显示在侧边栏作者卡片底部）
+# 格式: "图标": 链接 || 显示文字 || 图标颜色
+# --------------------------------------
+social:
+  "fab fa-github": https://github.com/ || GitHub || '#24292e'
+  "fas fa-envelope": "mailto: || Email || '#4a7dbe'"
+
+# --------------------------------------
+# 图片设置
+# --------------------------------------
+# 网站图标（浏览器标签页上的小图标）
+favicon: /images/avatar.jpeg
+
+# 头像设置（显示在侧边栏）
+avatar:
+  # 头像图片路径
+  img: /images/avatar.jpeg
+  # 头像特效: true 为旋转效果，false 关闭
+  effect: false
+
+# 是否禁用所有页面的顶部横幅图片
+disable_top_img: false
+
+# 默认顶部横幅图片（当某页面没有单独设置 banner 时使用）
+default_top_img:
+
+# 首页的顶部横幅图片
+index_img:
+
+# --------------------------------------
+# 文章元信息（显示在文章标题旁的信息）
+# --------------------------------------
+post_meta:
+  # 首页文章列表的元信息
+  page:
+    # 日期类型: created(创建日期) / updated(更新日期) / both(都显示)
+    date_type: created
+    # 日期格式: date(绝对日期) / relative(相对时间，如"3天前")
+    date_format: date
+    # 是否显示分类
+    categories: true
+    # 是否显示标签
+    tags: true
+    # 是否显示 "分类" "标签" 文字标签
+    label: true
+  # 文章详情页的元信息
+  post:
+    # 元信息位置: left(左对齐) / center(居中)
+    position: left
+    # 日期类型: created / updated / both
+    date_type: both
+    # 日期格式: date / relative
+    date_format: date
+    # 是否显示分类
+    categories: true
+    # 是否显示标签
+    tags: true
+    # 是否显示 "分类" "标签" 文字标签
+    label: true
+
+# --------------------------------------
+# 首页设置
+# --------------------------------------
+# 首页副标题（进入首页顶部横幅时显示的打字机效果文字）
+subtitle:
+  # 是否启用副标题
+  enable: true
+  # 是否启用打字机特效（关闭后只显示 static 第一行）
+  effect: true
+  # 第三方一言 API: false 关闭 / 1 一言网 / 2 其他API / 3 今日诗词
+  # 开启后会在你的 sub 前面显示一条随机句子
+  source: false
+  # 你的自定义标语（可多条，打字机效果循环播放）
+  sub:
+    - 代码改变世界
+    - 保持热爱，奔赴山海
+    - Stay hungry, stay foolish.
+
+# 首页文章布局样式
+# 1: 封面在左，信息在右
+# 2: 封面在右，信息在左
+# 3: 封面和信息左右交替
+# 4: 封面在上，信息在下
+# 5: 信息覆盖在封面上
+# 6: 瀑布流布局 - 封面在上，信息在下
+# 7: 瀑布流布局 - 信息覆盖在封面上
+index_layout: 3
+
+# 首页文章摘要
+index_post_content:
+  # 显示方式: 1 使用文章 description 字段 | 2 优先 description 否则自动摘要 | 3 自动摘要（默认）
+  method: 3
+  # 自动摘要截取的字数（method 为 2 或 3 时生效）
+  length: 500
+
+# --------------------------------------
+# 文章页设置
+# --------------------------------------
+# 文章目录（Table of Contents）
+toc:
+  # 是否在文章页显示目录
+  post: true
+  # 是否在独立页面显示目录
+  page: false
+  # 目录是否带序号
+  number: true
+  # 目录是否默认展开
+  expand: false
+  # 是否使用简洁风格的目录（仅文章页生效）
+  style_simple: false
+  # 是否显示阅读进度百分比
+  scroll_percent: false
+
+# 文章版权声明
+post_copyright:
+  # 是否启用
+  enable: true
+  # 是否解码版权信息（一般不用管）
+  decode: false
+  # 作者主页链接（留空则使用当前网站）
+  author_href:
+  # 版权协议
+  license: CC BY-NC-SA 4.0
+  # 版权协议链接
+  license_url: https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+# 打赏/赞助
+reward:
+  # 是否启用打赏功能
+  enable: false
+  # 提示文字
+  # text:
+  # 收款码图片
+  # QR_code:
+  #   - img: /img/wechat.jpg
+  #     link:
+  #     text: 微信
+  #   - img: /img/alipay.jpg
+  #     link:
+  #     text: 支付宝
+
+# 相关文章推荐
+related_post:
+  # 是否启用
+  enable: true
+  # 显示数量
+  limit: 6
+  # 按什么日期匹配: created / updated
+  date_type: created
+
+# 文章上下篇翻页
+# 1: "下一篇"链接到更早的文章（默认）
+# 2: "下一篇"链接到更新的文章
+# false: 关闭上下篇翻页
+post_pagination: 1
+
+# --------------------------------------
+# 页脚设置
+# --------------------------------------
+footer:
+  # 网站所有者信息
+  owner:
+    # 是否显示
+    enable: true
+    # 建站年份（显示如 2025 - 2026）
+    since: 2025
+  # 版权信息
+  copyright:
+    # 是否显示版权声明
+    enable: true
+    # 是否显示 Hexo 和主题版本
+    version: true
+  # 自定义页脚文字
+  custom_text: Made with ❤️ by YG
+
+# --------------------------------------
+# 侧边栏设置
+# --------------------------------------
+aside:
+  # 是否启用侧边栏
+  enable: true
+  # 是否默认隐藏侧边栏（读者可手动打开）
+  hide: false
+  # 是否在右下角显示隐藏/显示侧边栏的按钮
+  button: true
+  # 移动端是否显示侧边栏
+  mobile: true
+  # 侧边栏位置: left / right
+  position: right
+  # 侧边栏显示哪些模块
+  display:
+    archive: true    # 归档
+    tag: true        # 标签
+    category: true   # 分类
+
+  # 作者卡片
+  card_author:
+    # 是否显示
+    enable: true
+    # 个人简介（头像下方）
+    description: 全栈开发者 / 热爱开源
+    # 作者卡片按钮
+    button:
+      enable: true
+      icon: fab fa-github          # 按钮图标
+      text: Follow Me              # 按钮文字
+      link: https://github.com/    # 按钮链接
+
+  # 公告卡片
+  card_announcement:
+    # 是否显示
+    enable: true
+    # 公告内容（支持 HTML，<br> 换行）
+    content: 🎉 欢迎来到我的博客！<br>这里记录着我的学习与思考。
+
+  # 最新文章卡片
+  card_recent_post:
+    # 是否显示
+    enable: true
+    # 显示数量（0 = 全部）
+    limit: 5
+    # 排序方式: date(按发布日期) / updated(按更新日期)
+    sort: date
+
+  # 分类卡片
+  card_categories:
+    # 是否显示
+    enable: true
+    # 显示数量（0 = 全部）
+    limit: 8
+    # 是否展开子分类: none(不展开) / true(展开) / false(折叠)
+    expand: none
+
+  # 标签卡片
+  card_tags:
+    # 是否显示
+    enable: true
+    # 显示数量（0 = 全部）
+    limit: 40
+    # 是否启用彩色标签
+    color: false
+    # 排序方式: random(随机) / name(按名称) / length(按文章数)
+    orderby: random
+    # 排序方向: 1 升序 / -1 降序
+    order: 1
+
+  # 归档卡片
+  card_archives:
+    # 是否显示
+    enable: true
+    # 归档类型: monthly(按月) / yearly(按年)
+    type: monthly
+    # 日期格式（如 YYYY年MM月、MMMM YYYY）
+    format: YYYY年MM月
+    # 排序方向: 1 升序（旧→新） / -1 降序（新→旧）
+    order: -1
+    # 显示数量（0 = 全部）
+    limit: 8
+
+  # 网站信息卡片
+  card_webinfo:
+    # 是否显示
+    enable: true
+    # 是否显示文章总数
+    post_count: true
+    # 是否显示最后更新时间
+    last_push_date: true
+
+# --------------------------------------
+# 右下角按钮
+# --------------------------------------
+# 夜间模式
+darkmode:
+  # 是否启用
+  enable: true
+  # 是否显示切换按钮
+  button: true
+  # 自动切换模式:
+  #   1: 跟随系统设置，系统不支持时 18:00~6:00 自动切换
+  #   2: 始终 18:00~6:00 自动切换
+  #   false: 关闭自动切换
+  autoChangeMode: 1
+
+# 阅读模式（简化排版，去除侧边栏等，只显示正文）
+readmode: true
+
+# --------------------------------------
+# 不蒜子访问统计
+# --------------------------------------
+busuanzi:
+  # 网站总 UV（独立访客）: true 显示 / false 隐藏
+  site_uv: false
+  # 网站总 PV（页面浏览量）: true 显示 / false 隐藏
+  site_pv: false
+  # 单篇文章 PV: true 显示 / false 隐藏
+  page_pv: false
+
+# --------------------------------------
+# 主题配色（自定义颜色）
+# --------------------------------------
+theme_color:
+  # 是否启用自定义配色
+  enable: true
+  # 主题主色（链接、按钮等）
+  main: "#49B1F5"
+  # 分页器颜色
+  paginator: "#00c4b6"
+  # 按钮悬停颜色
+  button_hover: "#FF7242"
+  # 文字选中背景色
+  text_selection: "#00c4b6"
+  # 链接颜色
+  link_color: "#49B1F5"
+  # 分割线颜色
+  hr_color: "#A4D8FA"
+  # 代码块中特殊字符颜色
+  code_foreground: "#F47466"
+  # 代码块背景色
+  code_background: "rgba(27, 31, 35, .05)"
+  # 目录激活颜色
+  toc_color: "#00c4b6"
+  # 引用块左边框颜色
+  blockquote_padding_color: "#49b1f5"
+  # 引用块背景色
+  blockquote_background_color: "#49b1f5"
+  # 滚动条颜色
+  scrollbar_color: "#49b1f5"
+
+# 界面圆角（卡片、按钮等）
+rounded_corners_ui: true
+
+# 页面加载动画
+preloader:
+  # 是否启用
+  enable: true
+  # 动画类型: 1 = 全屏加载动画 | 2 = Pace 进度条
+  source: 1
+
+# 页面切换淡入动画
+enter_transitions: true
+
+# 默认显示模式: light(浅色) / dark(深色)
+display_mode: light
+
+# 分割线图标（文章中的 --- 水平线）
+# 图标来自 Font Awesome，使用 Unicode 值
+hr_icon:
+  enable: true
+  # '\f0c1' 对应 fa-link 图标
+  icon: '\f0c1'
+
+# --------------------------------------
+# 文章内容美化
+# --------------------------------------
+beautify:
+  # 是否启用
+  enable: false
+  # 美化范围: site(全站) / post(仅文章)
+  # field: post
+  # 标题前缀图标（Unicode 值）
+  # title_prefix_icon:
+  # 标题前缀图标颜色
+  # title_prefix_icon_color:
+
+# --------------------------------------
+# 背景特效
+# --------------------------------------
+# 彩带动画（背景上的彩色飘带）
+canvas_ribbon:
+  enable: false
+
+# 动态线条背景（类似蜘蛛网连线）
+canvas_nest:
+  enable: false
+
+# 鼠标点击烟花效果
+fireworks:
+  enable: false
+
+# 鼠标点击爱心效果
+click_heart:
+  enable: false
+
+# --------------------------------------
+# 图片灯箱（点击图片放大查看）
+# 可选: fancybox / medium_zoom
+# --------------------------------------
+lightbox: medium_zoom
+
+# --------------------------------------
+# 图片懒加载（滚动到可视区域才加载图片，提升性能）
+# --------------------------------------
+lazyload:
+  # 是否启用
+  enable: true
+  # 是否使用浏览器原生懒加载（推荐 true）
+  native: true
+  # 懒加载范围: site(全站) / post(仅文章)
+  field: site
+  # 占位图（图片加载前显示的图）
+  placeholder:
+  # 是否使用模糊占位效果
+  blur: false
+
+# --------------------------------------
+# PWA（渐进式网页应用，支持离线访问）
+# --------------------------------------
+pwa:
+  enable: false
+
+# --------------------------------------
+# Open Graph（社交分享时的预览卡片，如分享到 Twitter/Facebook）
+# --------------------------------------
+Open_Graph_meta:
+  enable: true
+
+# --------------------------------------
+# CDN 设置（静态资源的加载来源）
+# --------------------------------------
+CDN:
+  # 主题内部资源的 CDN: local(本地) / jsdelivr / unpkg / cdnjs / custom
+  internal_provider: local
+  # 第三方资源的 CDN: cdnjs / jsdelivr / unpkg / local / custom
+  third_party_provider: cdnjs
+  # 是否在 URL 中加版本号（防止缓存问题）
+  version: true
+
+# --------------------------------------
+# 数学公式（LaTeX / MathJax）
+# --------------------------------------
+math:
+  # 使用的数学引擎: mathjax / katex，留空不用
+  use:
+  # 是否每页都加载（false 则只在 front-matter 写了 mathjax: true 的文章才加载）
+  per_page: false
+
+# 注入自定义代码（在 <head> 或页面底部 </body> 前插入）
+inject:
+  head:
+    # 配置 MathJax 行内公式语法
+    - <script>MathJax={tex:{inlineMath:[['$','$'],['\\(','\\)']]},options:{enableMenu:false}};</script>
+  bottom:
+    # 加载本地 MathJax 脚本
+    - <script src="/js/mathjax/tex-mml-chtml.js"></script>
+
+# ======================================
+# 以下是 Butterfly 支持的但未写入此文件的配置
+# 如需使用，请自行添加对应段落
+# ======================================
+#
+# 1. 评论系统     — 支持 Disqus/Waline/Twikoo/Gitalk/Giscus 等
+# 2. 搜索功能     — 支持 Algolia/本地搜索/DocSearch
+# 3. 分享按钮     — 支持 Share.js / AddToAny
+# 4. 在线聊天     — 支持 Chatra/Tidio/Crisp 等
+# 5. 网站分析     — 支持百度统计/Google Analytics/Umami 等
+# 6. 广告         — 支持 Google AdSense
+# 7. 文章过期提醒  — noticeOutdate
+# 8. 文章在线编辑  — post_edit（链接到 GitHub 编辑）
+# 9. 简繁转换     — translate
+# 10. 打字特效     — activate_power_mode（Power Mode）
+# 11. 鼠标点击文字 — clickShowText
+# 12. 背景图片     — background
+# 13. 404 页面     — error_404
+# 14. 页脚导航     — footer.nav
+# 15. 全局字体     — font / blog_title_font
+# 16. 封面设置     — cover（文章列表封面图）
+# 17. 瞬间加载     — instantpage / pjax
+# 18. 通知弹窗     — snackbar
+# 19. 结构化数据   — structured_data（SEO）
+# 20. Anchor 锚点  — 滚动时自动更新 URL hash
+# 21. 图片替代文本 — photofigcaption
+# 22. 复制增强     — copy（复制内容时追加版权信息）
+# 23. 字数统计     — wordcount（需安装 hexo-wordcount 插件）
+# 24. 标签插件     — series / mermaid 图表 / chartjs 图表 / abcjs 乐谱 / note 提示框
+# 25. 最新评论     — aside.card_newest_comments
+# 26. 系列文章     — aside.card_post_series
+# 27. 网站运行时间 — aside.card_webinfo.runtime_date
+# 28. 右下角按钮顺序 — rightside_item_order
+# 29. 滚动百分比    — rightside_scroll_percent
+# 30. 更多背景特效 — canvas_fluttering_ribbon / clickShowText
+#
+# 完整配置参考: https://butterfly.js.org/posts/21cfbf15/
