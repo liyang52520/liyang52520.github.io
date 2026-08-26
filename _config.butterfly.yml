@@ -490,6 +490,56 @@ math:
   # 是否每页都加载（false 则只在 front-matter 写了 mathjax: true 的文章才加载）
   per_page: false
 
+# --------------------------------------
+# 搜索设置
+# --------------------------------------
+# 本地搜索: 无需第三方服务，数据由 hexo-generator-search 插件生成（_config.yml 的 search 段）
+search:
+  # 可选: algolia_search / local_search / docsearch，留空关闭搜索
+  use: local_search
+  placeholder:
+  local_search:
+    # 页面加载时预加载搜索数据
+    preload: false
+    # 每篇文章最多显示几条结果，-1 显示全部
+    top_n_per_article: 1
+    # 是否反转义 HTML 字符串
+    unescape: false
+    # 搜索结果分页
+    pagination:
+      enable: false
+      hitsPerPage: 8
+    CDN:
+
+# --------------------------------------
+# 评论系统 — Giscus（基于 GitHub Discussions）
+# --------------------------------------
+# 使用前需要在 GitHub 完成三步配置:
+#   1. 仓库 Settings → General → Features 中勾选 Discussions（启用 Discussions）
+#   2. 到 https://github.com/apps/giscus 安装 Giscus App 到本仓库
+#   3. 到 https://giscus.app/ 选择仓库和分类（分类类型需为 Announcements），
+#      复制页面生成的 repo_id 和 category_id 填到下面
+comments:
+  # 可选: Disqus/Gitalk/Valine/Waline/Twikoo/Giscus 等，留空关闭评论
+  use: giscus
+  # 评论按钮旁是否显示评论系统名称
+  text: true
+  # 评论懒加载（滚动到评论区才加载）
+  lazyload: false
+  # 文章页顶部是否显示评论数
+  count: false
+  # 首页文章卡片是否显示评论数
+  card_post_count: false
+
+giscus:
+  repo: liyang52520/liyang52520.github.io
+  repo_id:            # 从 https://giscus.app/ 获取后填入
+  category_id:        # 从 https://giscus.app/ 获取后填入
+  light_theme: light
+  dark_theme: dark
+  js:
+  option:
+
 # 注入自定义代码（在 <head> 或页面底部 </body> 前插入）
 inject:
   head:

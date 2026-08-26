@@ -93,6 +93,15 @@ include:
 exclude:
 ignore:
 
+# Search
+## Local search data, consumed by Butterfly theme (search.use: local_search)
+## https://github.com/hexojs/hexo-generator-search
+search:
+  path: search.xml
+  field: post
+  content: true
+  format: html
+
 # Extensions
 ## Plugins: https://hexo.io/plugins/
 ## Themes: https://hexo.io/themes/
