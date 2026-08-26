@@ -1,15 +1,60 @@
 # YG's Blog
 
-基于 [Hexo](https://hexo.io/) 的个人博客，使用 [Butterfly](https://github.com/jerryc127/hexo-theme-butterfly) 主题。
+基于 [Hexo](https://hexo.io/) + [Butterfly](https://github.com/jerryc127/hexo-theme-butterfly) 的个人博客，托管于 GitHub Pages。
 
-## 快速开始
+- 站点：<https://liyang52520.github.io>
+- 仓库：<https://github.com/liyang52520/liyang52520.github.io>
+
+## 快速开始（本地开发）
 
 ```bash
-npm install        # 安装依赖
+npm install        # 安装依赖（若报缓存权限错误，见文末"常见问题"）
 npx hexo server    # 本地预览
 ```
 
 浏览器打开 <http://localhost:4000>。
+
+## 日常发布流程
+
+部署已全自动：**推送 `main` 分支 → GitHub Actions 自动构建 → 部署到 GitHub Pages**。
+不需要手动执行 `hexo generate` / `hexo deploy`，也不需要把 `public/` 提交上去。
+
+### 发一篇新文章
+
+```bash
+# 1. 新建文章（生成到 source/_posts/ 下）
+npx hexo new "文章标题"
+
+# 2. 编辑文章（Markdown + Front Matter，见下文"文章写法"）
+#    可选：npx hexo server 本地预览，确认效果后 Ctrl+C 停掉
+
+# 3. 提交并推送
+git add -A
+git commit -m "发布: 文章标题"
+git push
+```
+
+推送后 1~2 分钟，访问 <https://liyang52520.github.io> 即可看到新文章。
+构建状态在仓库 **Actions** 页面查看，绿色 ✓ 表示部署成功。
+
+### 常见场景速查
+
+| 场景 | 操作 |
+|------|------|
+| 发新文章 | `npx hexo new "标题"` → 编辑 → `git add -A && git commit -m "..." && git push` |
+| 修改文章/配置 | 直接改 → `git add -A && git commit -m "..." && git push` |
+| 只改了一部分文件 | `git add 具体文件路径` 替代 `git add -A` |
+| 内容没改，只想重新部署 | 仓库 Actions 页面 → **Run workflow**（工作流支持手动触发） |
+| 本地预览 | `npx hexo server`（想看草稿加 `--draft`） |
+
+### 部署原理
+
+```
+git push (main)
+  → GitHub Actions 运行 .github/workflows/deploy.yml
+  → npm ci 安装依赖 → npx hexo generate 构建静态文件
+  → 部署到 GitHub Pages → 站点更新
+```
 
 ## 常用命令
 
@@ -18,31 +63,29 @@ npx hexo server    # 本地预览
 | `npx hexo new "标题"` | 新建文章 |
 | `npx hexo new draft "标题"` | 新建草稿 |
 | `npx hexo new page "页面名"` | 新建独立页面 |
-| `npx hexo server` | 启动本地预览 |
-| `npx hexo server --draft` | 预览时包含草稿 |
-| `npx hexo generate` | 生成静态文件 |
-| `npx hexo clean` | 清理缓存 |
-| `npx hexo deploy` | 部署到服务器 |
+| `npx hexo server` | 本地预览（默认 4000 端口） |
+| `npx hexo generate` | 生成静态文件到 `public/` |
+| `npx hexo clean` | 清理缓存（改了配置不生效时先跑这个） |
 
 ## 目录结构
 
 ```
 blog/
-├── _config.yml              # Hexo 主配置
+├── _config.yml              # Hexo 主配置（站点信息、搜索数据等）
 ├── _config.butterfly.yml    # Butterfly 主题配置
+├── .github/workflows/       # GitHub Actions 部署工作流（deploy.yml）
 ├── scaffolds/               # 文章模板（post / draft / page）
 ├── source/
 │   ├── _posts/              # 所有文章（Markdown）
-│   ├── _drafts/             # 草稿
+│   ├── css/custom.css       # 自定义样式入口（搜索框等外观定制）
 │   ├── images/              # 图片资源
 │   └── categories/          # 分类页
-├── themes/                  # 主题
-└── public/                  # 生成的静态网站（hexo generate 后产生）
+└── public/                  # 生成的静态网站（hexo generate 产生，已 gitignore）
 ```
 
 ## 文章写法
 
-文章位于 `source/_posts/`，使用 Markdown 编写。每篇文件顶部需要包含 Front Matter：
+文章位于 `source/_posts/`，使用 Markdown 编写，顶部带 Front Matter：
 
 ```yaml
 ---
@@ -53,16 +96,37 @@ categories: 分类名
 ---
 ```
 
+数学公式直接写 LaTeX 即可（Pandoc + 本地 MathJax，见下文"公式渲染"）：
+
+```markdown
+行内公式：$E = mc^2$
+
+$$
+\int_{0}^{\infty} e^{-x^2} \, dx = \frac{\sqrt{\pi}}{2}
+$$
+```
+
+## 已启用功能
+
+| 功能 | 说明 |
+|------|------|
+| 自动部署 | 推送 `main` 自动构建发布到 GitHub Pages |
+| 搜索 | 本地搜索（hexo-generator-search），无第三方依赖 |
+| 评论 | Giscus（基于 GitHub Discussions），评论数据存在仓库 Discussions 里 |
+| 数学公式 | Pandoc 渲染 + 本地 MathJax |
+| 自定义样式 | 编辑 `source/css/custom.css` 即可覆盖主题外观（无需改主题源码） |
+
 ## 技术栈
 
-- **Hexo** 7.x — 静态博客框架
-- **Butterfly** 主题
-- **Pandoc** 渲染器（支持 MathJax 数学公式）
-- **highlight.js** 代码高亮
+- **Hexo** 8.x — 静态博客框架
+- **Butterfly** 5.7 — 主题
+- **Pandoc** 渲染器 + **MathJax** — 数学公式
+- **highlight.js** — 代码高亮
+- **GitHub Actions** — 自动构建部署
 
 ---
 
-## 为什么选择 Pandoc + 本地 MathJax？
+## 公式渲染：为什么用 Pandoc + 本地 MathJax
 
 ### 问题：Markdown 渲染器会破坏 LaTeX
 
@@ -80,7 +144,7 @@ pandoc:
 
 jsdelivr / unpkg / cdnjs 都是境外 CDN，MathJax 加载 10 秒起步甚至超时。
 
-**解决方案：本地加载。** 把 MathJax 复制到项目目录，从 localhost 直接返回：
+**解决方案：本地加载。** 把 MathJax 复制到项目目录，从本地直接返回：
 
 ```bash
 cp node_modules/mathjax/tex-mml-chtml.js source/js/mathjax/
@@ -116,42 +180,20 @@ Markdown 源码 → Pandoc (--mathjax) → HTML (公式原样保留) → 本地 
 | jsdelivr CDN | 30s ~ 超时 | 不稳定 |
 | **本地文件** | **< 100ms** | **100%** |
 
-现在写文章只需：
-
-```markdown
-行内公式：$E = mc^2$
-
-块级公式：
-$$
-\int_{0}^{\infty} e^{-x^2} \, dx = \frac{\sqrt{\pi}}{2}
-$$
-```
-
-一切就绪，公式秒出。🚀
-
 ---
 
-## 部署
+## 常见问题
 
-站点已托管在 GitHub Pages: <https://liyang52520.github.io>
+### npm install 报权限错误（EPERM）
 
-仓库: <https://github.com/liyang52520/liyang52520.github.io>
-
-### 自动部署（推荐）
-
-项目已配置 GitHub Actions 工作流（`.github/workflows/deploy.yml`）：
-
-1. 推送 `main` 分支后，工作流会自动执行 `npm ci` + `npx hexo generate`，
-   并把生成的静态文件部署到 GitHub Pages。
-2. 也可以到仓库 Actions 页面手动触发（`workflow_dispatch`）。
-
-**首次使用**：在仓库 Settings → Pages 中，把 Source（来源）设为
-**GitHub Actions**，之后每次推送 main 分支就会自动发布。
-
-### 手动构建预览
+本机 `~/.npm` 缓存目录里有历史遗留的 root 属主文件，导致 npm 无法写入。绕过或修复：
 
 ```bash
-npx hexo clean   # 清理缓存
-npx hexo generate  # 生成静态文件到 public/
-npx hexo server    # 本地预览 http://localhost:4000
+npm install <包名> --cache /tmp/npm-cache-blog   # 临时绕过（推荐）
+sudo chown -R 501:20 ~/.npm                       # 一次性修复
 ```
+
+### 推送失败 / 认证问题
+
+仓库 remote 用的是 SSH（`git@github.com:liyang52520/liyang52520.github.io.git`），
+可随时验证：`ssh -T git@github.com`。推送前先 `git pull --rebase` 拉取远程最新，避免冲突。
