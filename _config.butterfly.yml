@@ -533,12 +533,16 @@ comments:
 
 giscus:
   repo: liyang52520/liyang52520.github.io
-  repo_id:            # 从 https://giscus.app/ 获取后填入
-  category_id:        # 从 https://giscus.app/ 获取后填入
+  repo_id: R_kgDOUDhuVA
+  category_id: DIC_kwDOUDhuVM4DEM_x
   light_theme: light
   dark_theme: dark
   js:
   option:
+    data-strict: '0'
+    data-emit-metadata: '0'
+    data-input-position: 'bottom'
+    data-lang: 'zh-CN'
 
 # 注入自定义代码（在 <head> 或页面底部 </body> 前插入）
 inject:
