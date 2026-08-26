@@ -1,0 +1,63 @@
+# 自动构建 Hexo 博客并部署到 GitHub Pages
+#
+# 触发方式:
+#   1. 推送 main 分支时自动触发
+#   2. 也可以在 Actions 页面手动触发 (workflow_dispatch)
+#
+# 首次使用前, 需要在仓库 Settings → Pages 中把 Source 设为 "GitHub Actions"
+
+name: Deploy Hexo Blog to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # hexo-renderer-pandoc 依赖 pandoc 二进制; ubuntu runner 一般已预装, 没有则安装
+      - name: Ensure pandoc is available
+        run: pandoc --version || (sudo apt-get update && sudo apt-get install -y pandoc)
+
+      - name: Build site
+        run: npx hexo generate
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

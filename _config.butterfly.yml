@@ -61,8 +61,8 @@ code_blocks:
 # 格式: "图标": 链接 || 显示文字 || 图标颜色
 # --------------------------------------
 social:
-  "fab fa-github": https://github.com/ || GitHub || '#24292e'
-  "fas fa-envelope": "mailto: || Email || '#4a7dbe'"
+  "fab fa-github": https://github.com/liyang52520 || GitHub || '#24292e'
+  "fas fa-envelope": "mailto:378776683@qq.com || Email || '#4a7dbe'"
 
 # --------------------------------------
 # 图片设置
@@ -77,14 +77,8 @@ avatar:
   # 头像特效: true 为旋转效果，false 关闭
   effect: false
 
-# 是否禁用所有页面的顶部横幅图片
-disable_top_img: false
-
-# 默认顶部横幅图片（当某页面没有单独设置 banner 时使用）
-default_top_img:
-
-# 首页的顶部横幅图片
-index_img:
+# 是否禁用所有页面的顶部横幅大图（true = 完全不要，直接显示文章列表）
+disable_top_img: true
 
 # --------------------------------------
 # 文章元信息（显示在文章标题旁的信息）
@@ -263,14 +257,14 @@ aside:
       enable: true
       icon: fab fa-github          # 按钮图标
       text: Follow Me              # 按钮文字
-      link: https://github.com/    # 按钮链接
+      link: https://github.com/liyang52520    # 按钮链接
 
   # 公告卡片
   card_announcement:
     # 是否显示
     enable: true
     # 公告内容（支持 HTML，<br> 换行）
-    content: 🎉 欢迎来到我的博客！<br>这里记录着我的学习与思考。
+    content: 欢迎来到我的博客！<br>这里记录着我的学习与思考。
 
   # 最新文章卡片
   card_recent_post:
@@ -342,6 +336,9 @@ darkmode:
 
 # 阅读模式（简化排版，去除侧边栏等，只显示正文）
 readmode: true
+
+# 右下角齿轮按钮的旋转动画（true = 转 / false = 不转）
+rightside_config_animation: false
 
 # --------------------------------------
 # 不蒜子访问统计
@@ -496,8 +493,8 @@ math:
 # 注入自定义代码（在 <head> 或页面底部 </body> 前插入）
 inject:
   head:
-    # 配置 MathJax 行内公式语法
-    - <script>MathJax={tex:{inlineMath:[['$','$'],['\\(','\\)']]},options:{enableMenu:false}};</script>
+    # 关闭公告栏喇叭图标的晃动动画（fa-shake 是 Font Awesome 的抖动类）
+    - '<style>.card-announcement .fa-shake { --fa-animation-duration: 0s; animation: none !important; }</style>'
   bottom:
     # 加载本地 MathJax 脚本
     - <script src="/js/mathjax/tex-mml-chtml.js"></script>
