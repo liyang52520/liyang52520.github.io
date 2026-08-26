@@ -547,6 +547,8 @@ giscus:
 # 注入自定义代码（在 <head> 或页面底部 </body> 前插入）
 inject:
   head:
+    # 自定义样式（搜索框等外观定制，见 source/css/custom.css）
+    - <link rel="stylesheet" href="/css/custom.css">
     # 关闭公告栏喇叭图标的晃动动画（fa-shake 是 Font Awesome 的抖动类）
     - '<style>.card-announcement .fa-shake { --fa-animation-duration: 0s; animation: none !important; }</style>'
   bottom:

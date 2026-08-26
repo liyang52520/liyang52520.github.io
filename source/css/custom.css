@@ -1,0 +1,43 @@
+/* ======================================
+   Butterfly 自定义样式 — 搜索框定制示例
+   ======================================
+   这个文件通过 _config.butterfly.yml 的 inject.head 引入。
+   需要调整哪个样式, 取消对应代码的注释即可; 也可以直接改数值。
+
+   常用搜索框选择器:
+     .search-dialog           搜索弹窗(宽度/位置/圆角/背景)
+     .local-search-input input  输入框(边框/圆角/内边距)
+     .search-keyword          搜索结果里的关键词高亮色
+     #search-mask             点击搜索框背后的半透明遮罩
+     #search-button           导航栏里的搜索按钮
+   ====================================== */
+
+/* 搜索弹窗: 宽度 + 圆角 + 背景色 */
+/* .search-dialog {
+  width: 700px;
+  margin-left: -350px;   /* 宽度改大时同步改, 保持居中 */
+  border-radius: 12px;
+  background: var(--card-bg);
+} */
+
+/* 输入框: 边框颜色 + 圆角 + 内边距 */
+/* .local-search-input input {
+  border-color: var(--theme-color);
+  border-radius: 10px;
+  padding: 8px 16px;
+} */
+
+/* 搜索关键词高亮色 */
+/* .search-keyword {
+  color: #FF7242;
+} */
+
+/* 遮罩层: 颜色 + 透明度 */
+/* #search-mask {
+  background: rgba(0, 0, 0, .7);
+} */
+
+/* 导航栏搜索按钮图标颜色 */
+/* #search-button i {
+  color: var(--theme-color);
+} */
