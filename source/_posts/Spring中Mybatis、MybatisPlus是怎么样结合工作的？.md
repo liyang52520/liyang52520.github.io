@@ -5,8 +5,6 @@ tags: spring;mybatis;
 categories: develop
 ---
 
-# Spring、MyBatis、MyBatis-Plus 协作全解析：从核心原理到多数据源与批量插入实战
-
 ## 引子：一个常见的困惑
 
 在 Spring Boot 项目中，我们几乎每天都在用 MyBatis 或 MyBatis-Plus 操作数据库。只要在 Mapper 接口上写几个方法，在 Service 里 `@Autowired` 注入，就能直接调用。一切看起来理所当然。
