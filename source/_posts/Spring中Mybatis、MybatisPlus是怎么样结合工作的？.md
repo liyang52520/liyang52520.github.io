@@ -756,6 +756,7 @@ public class PostgreSQLConfig {
 - **如果指定了 `sqlSessionTemplateRef`**：`MapperFactoryBean` 直接使用容器中已存在的 `SqlSessionTemplate` Bean。
 - **如果只指定了 `sqlSessionFactoryRef`**：`MapperFactoryBean` 会用这个 Factory **自己创建一个私有的 `SqlSessionTemplate`**。
 - **如果两者都没指定**：按类型自动注入，多个同类型 Bean 时报错。
+- **如果两者同时指定**：启动后会提示` Cannot use both: sqlSessionTemplate and sqlSessionFactory together. sqlSessionFactory is ignored.`，所以，最佳实践是只指定``sqlSessionTemplateRef``
 
 所以，只指定 `sqlSessionFactoryRef` 会导致：**每个 Mapper 接口都会持有一个私有的 `SqlSessionTemplate` 实例。**
 
@@ -763,8 +764,6 @@ public class PostgreSQLConfig {
 
 1. **无法复用与统一管理**：每个 Mapper 都持有一个私有的 `SqlSessionTemplate`，无法享受共享 Bean 带来的内存优化和统一配置（如 `ExecutorType`）的好处。
 2. **潜在的启动失败风险**：如果容器中还存在其他 `SqlSessionTemplate` Bean，你的 Mapper 在自动注入时可能会因**类型不唯一**而导致启动失败。
-
-- **如果两者同时指定**：启动后会提示` Cannot use both: sqlSessionTemplate and sqlSessionFactory together. sqlSessionFactory is ignored.`，所以，最佳实践是只指定``sqlSessionTemplateRef``
 
 ### 6.4 正确的多数据源配置
 
