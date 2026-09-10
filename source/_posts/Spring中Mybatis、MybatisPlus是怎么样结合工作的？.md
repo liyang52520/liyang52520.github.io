@@ -5,7 +5,7 @@ tags: spring;mybatis;
 categories: develop
 ---
 
-# Spring、MyBatis、MyBatis-Plus 协作全解析：从核心原理到 @MapperScan 多数据源实战
+# Spring、MyBatis、MyBatis-Plus 协作全解析：从核心原理到多数据源与批量插入实战
 
 ## 引子：一个常见的困惑
 
@@ -15,7 +15,9 @@ categories: develop
 
 > - `UserMapper` 只是一个接口，没有实现类，为什么能被注入？
 > - `BaseMapper` 里的 `insert`、`selectById` 方法，我从来没有写过 SQL，它们是怎么执行的？
-> - `@MapperScan` 到底做了什么？为什么多数据源时还要配置 `sqlSessionFactoryRef` 和 `sqlSessionTemplateRef`？
+> - `@MapperScan` 到底做了什么？它和 MyBatis-Plus 重写的 `MybatisMapperRegistry` 是怎么关联上的？
+> - `MybatisPlusAutoConfiguration` 和 `@MapperScan` 是什么关系？
+> - 多数据源时为什么还要配置 `sqlSessionFactoryRef` 和 `sqlSessionTemplateRef`？
 > - MyBatis-Plus 的 `saveBatch` 为什么性能不理想？有没有真正的批量插入方案？
 
 这篇文章就沿着这些问题，把 Spring、MyBatis、MyBatis-Plus 三者的协作关系一层层拆开，最后落到多数据源配置和批量插入的实战上。
@@ -63,8 +65,6 @@ public class Configuration {
 ### 1.3 启动阶段：`MapperRegistry` 与 `MapperAnnotationBuilder`
 
 启动阶段的核心任务是：**把 XML 或注解中定义的 SQL 解析成 `MappedStatement`，注册到 `Configuration.mappedStatements` 容器里。**
-
-那谁来解析？解析完怎么注册？这就要看两个关键组件。
 
 #### `MapperRegistry`：接口与代理工厂的注册表
 
@@ -115,7 +115,7 @@ public void parse() {
 
 在 `parseStatement()` 中，它会读取注解、构建 `SqlSource`、创建 `MappedStatement`，最终调用 `configuration.addMappedStatement(...)` 注册到全局容器。
 
-**所以两者分工是**：
+**两者分工**：
 
 - `MapperRegistry`：管"**接口 → 代理工厂**"的注册，并触发解析。
 - `MapperAnnotationBuilder`：管"**接口方法 → MappedStatement**"的解析和注册。
@@ -166,9 +166,7 @@ public class MapperProxy<T> implements InvocationHandler, Serializable {
 1. 解析方法签名（`select` / `insert` / `update` / `delete`）；
 2. 从 `Configuration.mappedStatements` 中查找对应的 `MappedStatement`。
 
-**所以 `MapperProxy` 的本质就是：把接口方法调用翻译成"查找 MappedStatement + 调用 SqlSession 执行"。**
-
-#### 完整调用链
+**完整调用链**：
 
 ```
 userMapper.selectById(1L)
@@ -203,11 +201,38 @@ MyBatis-Plus 重写了两个关键类：
 | `MapperRegistry` | `MybatisMapperRegistry` | 在 `addMapper()` 中改用 MP 自己的解析器 |
 | `MapperAnnotationBuilder` | `MybatisMapperAnnotationBuilder` | 在 `parse()` 中额外为 `BaseMapper` 通用方法注入 SQL |
 
-`MybatisMapperAnnotationBuilder.parse()` 的增强逻辑大致是：
+`MybatisMapperRegistry.addMapper()` 的实现：
 
 ```java
+@Override
+public <T> void addMapper(Class<T> type) {
+    if (type.isInterface()) {
+        if (hasMapper(type)) {
+            return;
+        }
+        boolean loadCompleted = false;
+        try {
+            // 1. 注册代理工厂
+            knownMappers.put(type, new MapperProxyFactory<>(type));
+            // 2. 使用 MyBatis-Plus 的解析器（不是原生的 MapperAnnotationBuilder）
+            MybatisMapperAnnotationBuilder parser = new MybatisMapperAnnotationBuilder(config, type);
+            parser.parse();   // ★ 触发解析和 SQL 注入
+            loadCompleted = true;
+        } finally {
+            if (!loadCompleted) {
+                knownMappers.remove(type);
+            }
+        }
+    }
+}
+```
+
+`MybatisMapperAnnotationBuilder.parse()` 的增强逻辑：
+
+```java
+@Override
 public void parse() {
-    // 1. 原生逻辑：解析用户注解和 XML
+    // 1. 原生逻辑：解析 XML 和注解
     // ...
 
     // 2. MP 增强：如果接口继承了 BaseMapper
@@ -226,7 +251,7 @@ public void parse() {
 
 ### 2.3 这些重写类是怎么进入 MyBatis 启动流程的？
 
-这是关键问题：MyBatis-Plus 重写了 `MapperRegistry` 和 `MapperAnnotationBuilder`，但 MyBatis 启动流程是 MyBatis 自己的代码，它是怎么"偷梁换柱"的？
+MyBatis-Plus 重写了 `MapperRegistry` 和 `MapperAnnotationBuilder`，但 MyBatis 启动流程是 MyBatis 自己的代码，它是怎么"偷梁换柱"的？
 
 答案在于 **`MybatisConfiguration`**。
 
@@ -234,6 +259,22 @@ public void parse() {
 
 1. **初始化自己的 `MybatisMapperRegistry`**：它用一个 `MybatisMapperRegistry` 的实例，**覆盖**了父类中默认的 `MapperRegistry` 字段。
 2. **重写 `addMapper` 方法**：当 MyBatis 启动流程调用 `configuration.addMapper()` 时，实际调用的是 `MybatisConfiguration` 重写后的版本，该方法会将调用委托给 `MybatisMapperRegistry`。
+
+```java
+public class MybatisConfiguration extends Configuration {
+    protected final MybatisMapperRegistry mapperRegistry;
+
+    public MybatisConfiguration() {
+        super();
+        this.mapperRegistry = new MybatisMapperRegistry(this);  // ★ 替换原生 MapperRegistry
+    }
+
+    @Override
+    public <T> void addMapper(Class<T> type) {
+        this.mapperRegistry.addMapper(type);  // 委托给 MybatisMapperRegistry
+    }
+}
+```
 
 而 `MybatisConfiguration` 又是通过 `MybatisSqlSessionFactoryBean` 创建的。这个 FactoryBean 由 Spring Boot 的 `MybatisPlusAutoConfiguration` 创建，替换了原生的 `SqlSessionFactoryBean`。
 
@@ -266,110 +307,6 @@ MybatisMapperAnnotationBuilder.parse() 执行
 **为什么是 `MybatisPlusAutoConfiguration` 而不是 `MybatisAutoConfiguration`？**
 
 因为引入 `mybatis-plus-boot-starter` 时，`MybatisAutoConfiguration` 所在的 jar（`mybatis-spring-boot-autoconfigure`）根本不在 classpath 上。Spring Boot 只能扫描到 `MybatisPlusAutoConfiguration`，它创建的是 `MybatisSqlSessionFactoryBean`，从而把 MyBatis-Plus 的全套自定义实现注入了 MyBatis 的启动流程。
-
-### 2.4 动态注入的典型应用：批量插入
-
-理解了动态注入机制后，我们来看一个非常实用的场景：**批量插入**。MyBatis-Plus 的批量插入功能，正是动态注入机制的直接应用。
-
-#### `saveBatch` 的局限：伪批量
-
-MyBatis-Plus 的 `ServiceImpl` 中提供了 `saveBatch` 方法，用起来很方便：
-
-```java
-userService.saveBatch(userList);
-```
-
-但它的底层实现是：
-
-```java
-for (T entity : entityList) {
-    sqlSession.insert(sqlStatement, entity);   // 每次都是一条独立 INSERT
-    if (i % batchSize == 0) {
-        sqlSession.flushStatements();          // 定期刷入
-    }
-}
-```
-
-**它并没有合并 SQL**，只是减少了事务提交次数。每条记录仍然是一条独立的 `INSERT` 语句，网络往返次数并没有减少。
-
-要真正提升性能，必须配合 JDBC 驱动参数 `rewriteBatchedStatements=true`。它的原理是：MySQL JDBC 驱动的 `executeBatchInternal()` 方法中，当 `batchHasPlainStatements == false` 且 `rewriteBatchedStatements == true` 时，会走 `executeBatchedInserts()` 路径，把多条结构相同的 `INSERT` 在内存中拼成一条多值 SQL：
-
-```sql
-INSERT INTO user (name, age) VALUES (?, ?), (?, ?), (?, ?), ...;
-```
-
-这样一次网络往返就能插入所有数据。但这种方式依赖驱动层重写，且只对 `INSERT` 等特定语句有效。
-
-#### `insertBatchSomeColumn`：真批量
-
-MyBatis-Plus 提供了一个官方扩展方法 `insertBatchSomeColumn`，它从 **SQL 生成阶段** 就直接构建多值 `INSERT`，不依赖 JDBC 驱动的重写。
-
-**它的原理**：回顾前文，MyBatis-Plus 通过重写 `MybatisMapperAnnotationBuilder`，在启动时遍历 `BaseMapper` 的通用方法，调用每个 `AbstractMethod` 的 `injectMappedStatement()` 方法，把生成的 `MappedStatement` 注册到 `Configuration` 中。
-
-`insertBatchSomeColumn` 正是 `AbstractMethod` 的一个子类。它的 `injectMappedStatement()` 会：
-
-1. 通过 `tableInfo.getAllInsertSqlColumnMaybeIf()` 获取列名脚本；
-2. 通过 `tableInfo.getAllInsertSqlPropertyMaybeIf()` 获取属性表达式；
-3. 拼接出带 `<foreach>` 的 SQL 模板：
-
-```sql
-INSERT INTO user (name, age) VALUES
-<foreach collection="list" item="item" separator=",">
-    (#{item.name}, #{item.age})
-</foreach>
-```
-
-4. 创建 `MappedStatement` 并注册到 `Configuration.mappedStatements` 中。
-
-运行时，MyBatis 的 `<foreach>` 标签会把 `list` 展开，**最终只生成一条多值 SQL**，一次网络往返发送给数据库。
-
-**使用示例**：
-
-**步骤 1：自定义 SQL 注入器**
-
-```java
-@Component
-public class MySqlInjector extends DefaultSqlInjector {
-    @Override
-    public List<AbstractMethod> getMethodList(Class<?> mapperClass) {
-        List<AbstractMethod> methodList = super.getMethodList(mapperClass);
-        methodList.add(new InsertBatchSomeColumn());
-        return methodList;
-    }
-}
-```
-
-**步骤 2：定义自定义 BaseMapper**
-
-```java
-public interface MyBaseMapper<T> extends BaseMapper<T> {
-    int insertBatchSomeColumn(List<T> entityList);
-}
-```
-
-**步骤 3：业务 Mapper 继承**
-
-```java
-public interface UserMapper extends MyBaseMapper<User> {}
-```
-
-**步骤 4：调用**
-
-```java
-userMapper.insertBatchSomeColumn(userList);
-```
-
-**两种方案对比**：
-
-| 特性 | `saveBatch` + `rewriteBatchedStatements` | `insertBatchSomeColumn` |
-|:---|:---|:---|
-| **谁在合并** | JDBC 驱动 | MyBatis-Plus（SQL 生成阶段） |
-| **合并时机** | SQL 发送前 | SQL 生成时 |
-| **是否依赖 JDBC 参数** | 是 | 否 |
-| **SQL 形式** | 多条独立 INSERT（驱动重写） | 始终一条多值 INSERT |
-| **性能** | 中 | 高 |
-
-**一句话总结**：`saveBatch` 是"伪批量"，需要驱动帮忙才能合并；`insertBatchSomeColumn` 是"真批量"，从一开始就只生成一条 SQL。后者正是 MyBatis-Plus 动态注入机制的绝佳案例。
 
 ---
 
@@ -413,7 +350,32 @@ public class MapperFactoryBean<T> extends SqlSessionDaoSupport implements Factor
 
 `getObject()` 内部调用 `getSqlSession().getMapper()`，最终会走到 MyBatis 核心层的 `MapperRegistry.getMapper()`，由 `MapperProxyFactory` 创建代理对象。
 
-### 3.3 `SqlSessionTemplate`：线程安全的会话封装
+### 3.3 隐藏的关键：`MapperFactoryBean.checkDaoConfig()`
+
+`MapperFactoryBean` 继承自 `SqlSessionDaoSupport`，后者继承自 Spring 的 `DaoSupport`。`DaoSupport` 实现了 `InitializingBean`，会在 Bean 属性注入完成后调用 `afterPropertiesSet()`，进而调用 `checkDaoConfig()`。
+
+`MapperFactoryBean` 重写了 `checkDaoConfig()`：
+
+```java
+@Override
+protected void checkDaoConfig() {
+    super.checkDaoConfig();
+    notNull(this.mapperInterface, "Property 'mapperInterface' is required");
+    Configuration configuration = getSqlSession().getConfiguration();
+    if (this.addToConfig && !configuration.hasMapper(this.mapperInterface)) {
+        try {
+            // ★★★ 关键调用：把 UserMapper 注册到 Configuration 中
+            configuration.addMapper(this.mapperInterface);
+        } catch (Exception e) {
+            // ...
+        }
+    }
+}
+```
+
+**这一步是 Spring 集成层和 MyBatis-Plus 增强层的连接点**：`MapperFactoryBean` 在初始化时，调用了 `configuration.addMapper(UserMapper.class)`，从而触发 MyBatis-Plus 的 `MybatisMapperRegistry`，完成 SQL 注入。
+
+### 3.4 `SqlSessionTemplate`：线程安全的会话封装
 
 `SqlSessionTemplate` 是 mybatis-spring 对 `SqlSession` 的线程安全封装。它本身**不持有真正的 `SqlSession`**，而是通过一个动态代理 `SqlSessionInterceptor` 来管理：
 
@@ -440,7 +402,7 @@ public class SqlSessionTemplate implements SqlSession {
 
 **所以 `SqlSessionTemplate` 是线程安全的，它可以作为单例 Bean 被所有 Mapper 共享。**
 
-### 3.4 为什么同时定义 `SqlSessionFactory` 和 `SqlSessionTemplate`？
+### 3.5 为什么同时定义 `SqlSessionFactory` 和 `SqlSessionTemplate`？
 
 从技术上讲，**只定义 `SqlSessionFactory` 也能跑通**。`MapperFactoryBean` 继承自 `SqlSessionDaoSupport`，而 `SqlSessionDaoSupport.setSqlSessionFactory()` 会自动创建一个 `SqlSessionTemplate`。
 
@@ -466,8 +428,6 @@ public class SqlSessionTemplate implements SqlSession {
 答案就是 `@MapperScan`。
 
 ### 4.2 第一环：`@MapperScan` 是个"伪装"的 `@Import`
-
-`@MapperScan` 注解本身的源码非常简单：
 
 ```java
 @Retention(RetentionPolicy.RUNTIME)
@@ -523,47 +483,54 @@ definition.getConstructorArgumentValues().addGenericArgumentValue(beanClassName)
 
 同时，`ClassPathMapperScanner` 还会根据 `@MapperScan` 中是否指定了 `sqlSessionFactoryRef` 或 `sqlSessionTemplateRef`，把对应的 Bean 名称也设置到 `BeanDefinition` 的属性中，后续注入时会用到这些名称。
 
-### 4.6 第五环：`MapperFactoryBean` 生产代理对象
+### 4.6 第五环：`MapperFactoryBean` 初始化，触发 SQL 注入
 
-当 Spring 容器需要实例化 `userMapper` 这个 Bean 时，它发现 `beanClass` 是 `MapperFactoryBean`，于是会：
+Spring 容器启动到实例化阶段，开始创建 `userMapper` 这个 Bean。它发现 `beanClass` 是 `MapperFactoryBean`，于是：
 
-1. 实例化 `MapperFactoryBean` 本身。
-2. 调用它的 **`getObject()`** 方法来获取**真正要放入容器的对象**。
+1. 实例化 `MapperFactoryBean`。
+2. 注入 `sqlSessionFactory` 和 `sqlSessionTemplate`。
+3. 调用 `afterPropertiesSet()` → `checkDaoConfig()`。
 
-`MapperFactoryBean.getObject()` 的实现大致是：
-
-```java
-@Override
-public T getObject() throws Exception {
-    return getSqlSession().getMapper(this.mapperInterface);
-}
-```
-
-**这里的 `getSqlSession()` 返回的是什么？** 就是 `SqlSessionTemplate`。`MapperFactoryBean` 继承自 `SqlSessionDaoSupport`，后者持有 `SqlSessionTemplate` 或 `SqlSessionFactory`。
-
-- 如果 `@MapperScan` 指定了 `sqlSessionTemplateRef`，Spring 会把对应的 `SqlSessionTemplate` Bean 注入进来。
-- 如果只指定了 `sqlSessionFactoryRef`，`SqlSessionDaoSupport` 会**用它自己创建一个私有的 `SqlSessionTemplate`**。
-- 如果两者都没指定，会尝试按类型自动注入，多个同类型 Bean 时就会报错。
-
-**而 `getMapper()` 的调用链，正是 MyBatis 核心流程**：
+**关键就在这里**：`checkDaoConfig()` 调用了 `configuration.addMapper(UserMapper.class)`，触发了第二部分的 MyBatis-Plus 增强逻辑：
 
 ```
-MapperFactoryBean.getObject()
+MapperFactoryBean.checkDaoConfig()
+    ↓ 调用 configuration.addMapper(UserMapper.class)
     ↓
-SqlSessionTemplate.getMapper(UserMapper.class)
+MybatisConfiguration.addMapper()
+    ↓ 委托给 MybatisMapperRegistry（不是原生 MapperRegistry）
     ↓
-Configuration.getMapper(UserMapper.class, sqlSession)
+MybatisMapperRegistry.addMapper()
+    ↓ 创建 MybatisMapperAnnotationBuilder
+    ↓ 调用 parser.parse()
     ↓
-MapperRegistry.getMapper(UserMapper.class, sqlSession)
+MybatisMapperAnnotationBuilder.parse()
+    ├── 1. 解析 XML 和注解（原生逻辑）
+    └── 2. 检查是否继承 BaseMapper
+            ↓ 如果是，触发 SqlInjector
+            ↓
+        AbstractMethod.injectMappedStatement()
+            ↓ 生成 MappedStatement 并注册到 Configuration.mappedStatements
     ↓
-MapperProxyFactory.newInstance(sqlSession)
-    ↓
-Proxy.newProxyInstance(...)   ← JDK 动态代理
-    ↓
-返回 UserMapper 的代理对象
+UserMapper 拥有了 insert、selectById 等通用方法
 ```
 
-### 4.7 完整链路
+### 4.7 `@MapperScan` 与 `MybatisMapperRegistry` 的关联
+
+**这是整个体系中最关键的连接点，之前分开讲容易让人困惑。**
+
+- `@MapperScan` 负责在 Spring 层注册 `MapperFactoryBean`；
+- `MapperFactoryBean` 初始化时调用 `configuration.addMapper()`；
+- 这个调用进入 MyBatis-Plus 重写的 `MybatisMapperRegistry`，触发 SQL 注入。
+
+**`@MapperScan` 是"触发器"，`MybatisMapperRegistry` 是"执行者"，连接它们的是 `MapperFactoryBean` 的初始化过程。**
+
+- 没有 `@MapperScan`，`MapperFactoryBean` 不会被注册，`addMapper()` 不会被调用，`MybatisMapperRegistry` 永远不会被触发。
+- 没有 `MybatisMapperRegistry`，`addMapper()` 会走原生逻辑，`BaseMapper` 的通用方法不会被注入。
+
+两者缺一不可。
+
+### 4.8 完整链路
 
 ```text
 Spring 容器 refresh()
@@ -586,6 +553,24 @@ ClassPathMapperScanner.doScan()
     ↓
 Spring 实例化 userMapper Bean
     ↓ 发现是 MapperFactoryBean
+    ↓ 注入 SqlSessionFactory / SqlSessionTemplate
+    ↓ 调用 afterPropertiesSet() → checkDaoConfig()
+    ↓
+MapperFactoryBean.checkDaoConfig()
+    ↓ configuration.addMapper(UserMapper.class)
+    ↓
+MybatisConfiguration.addMapper()
+    ↓ 委托给 MybatisMapperRegistry
+    ↓
+MybatisMapperRegistry.addMapper()
+    ↓ 创建 MybatisMapperAnnotationBuilder
+    ↓ parser.parse()
+    ↓
+MybatisMapperAnnotationBuilder.parse()
+    ├── 1. 解析 XML 和注解（原生逻辑）
+    └── 2. 检查是否继承 BaseMapper，触发 SQL 注入
+    ↓
+UserMapper 拥有了所有通用 CRUD 方法
     ↓
 MapperFactoryBean.getObject()
     ↓
@@ -602,15 +587,128 @@ MapperProxyFactory.newInstance() → JDK 动态代理
 
 ---
 
-## 第五部分：多数据源场景下的 `@MapperScan`
+## 第五部分：`MybatisPlusAutoConfiguration` 与 `@MapperScan` 的关系
 
-### 5.1 问题的引出
+### 5.1 两条独立的路径
+
+很多人在学到这里时会感到困惑：`MybatisPlusAutoConfiguration` 和 `@MapperScan` 到底什么关系？怎么感觉没关联上？
+
+**核心答案：它们是两条独立的路径，最终在 `MapperFactoryBean` 这里汇合。`MybatisPlusAutoConfiguration` 负责"造引擎"，`@MapperScan` 负责"装轮子"，两者通过 `SqlSessionFactory` / `SqlSessionTemplate` 这两个 Bean 连接起来。**
+
+#### 路径一：`MybatisPlusAutoConfiguration` —— 造引擎
+
+它的职责是**创建基础设施 Bean**：
+
+```java
+@Configuration
+@ConditionalOnClass({SqlSessionFactory.class, MybatisSqlSessionFactoryBean.class})
+@ConditionalOnSingleCandidate(DataSource.class)
+public class MybatisPlusAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public SqlSessionFactory sqlSessionFactory(DataSource dataSource) {
+        MybatisSqlSessionFactoryBean factory = new MybatisSqlSessionFactoryBean();
+        // ...
+        return factory.getObject();
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public SqlSessionTemplate sqlSessionTemplate(SqlSessionFactory sqlSessionFactory) {
+        return new SqlSessionTemplate(sqlSessionFactory);
+    }
+}
+```
+
+它产出两个关键 Bean：
+
+- **`SqlSessionFactory`**：内部持有 `MybatisConfiguration`，启动时负责解析 SQL、注册 `MappedStatement`。
+- **`SqlSessionTemplate`**：线程安全的 `SqlSession` 封装，后续被 `MapperFactoryBean` 使用。
+
+**注意**：`MybatisPlusAutoConfiguration` **不负责注册任何 Mapper 接口**。它不知道 `UserMapper` 的存在。
+
+#### 路径二：`@MapperScan` —— 装轮子
+
+它的职责是**把 Mapper 接口注册为 `MapperFactoryBean`**：
+
+```java
+@MapperScan("com.xx.mapper")
+```
+
+它通过 `MapperScannerRegistrar` → `MapperScannerConfigurer` → `ClassPathMapperScanner`，把 `UserMapper` 接口的 `BeanDefinition` 改写为 `MapperFactoryBean`。
+
+**注意**：`@MapperScan` **不负责创建 `SqlSessionFactory`**。它只管扫描接口、注册 BeanDefinition。
+
+### 5.2 汇合点：`MapperFactoryBean`
+
+两条路径在 `MapperFactoryBean` 这里汇合。
+
+`MapperFactoryBean` 继承自 `SqlSessionDaoSupport`，需要注入 `SqlSessionFactory` 或 `SqlSessionTemplate`：
+
+- 单数据源下：容器里只有一个 `SqlSessionFactory` 和一个 `SqlSessionTemplate`（由 `MybatisPlusAutoConfiguration` 创建），Spring 按类型自动注入。
+- 多数据源下：容器里有多个同类型 Bean，必须通过 `@MapperScan` 的 `sqlSessionFactoryRef` 和 `sqlSessionTemplateRef` 显式指定。
+
+### 5.3 为什么会产生"没关联上"的感觉
+
+因为**它们确实没有直接的代码调用关系**：
+
+- `MybatisPlusAutoConfiguration` 里没有任何一行代码提到 `@MapperScan`。
+- `@MapperScan` 的源码里也没有任何一行代码提到 `MybatisPlusAutoConfiguration`。
+
+它们是通过 **Spring 容器的依赖注入机制** 间接关联的：
+
+- `MybatisPlusAutoConfiguration` 把 `SqlSessionFactory` 和 `SqlSessionTemplate` 注册到容器中。
+- `@MapperScan` 把 `MapperFactoryBean` 注册到容器中。
+- Spring 在实例化 `MapperFactoryBean` 时，发现它需要 `SqlSessionFactory`，于是从容器中查找并注入。
+
+**这就像"发电厂"和"冰箱"的关系**：发电厂不关心谁在用它的电，冰箱也不关心电从哪个发电厂来，它们通过"电网"（Spring 容器）连接在一起。
+
+### 5.4 多数据源时，`MybatisPlusAutoConfiguration` 还需要吗？
+
+**答案是：仍然会被加载，但它创建的 `SqlSessionFactory` 和 `SqlSessionTemplate` Bean 会被跳过。**
+
+只要 `mybatis-plus-boot-starter` 在 classpath 上，`MybatisPlusAutoConfiguration` 就会被 Spring Boot 的自动配置机制发现并处理。但它的关键 Bean 方法上都标了 `@ConditionalOnMissingBean`：
+
+```java
+@Bean
+@ConditionalOnMissingBean
+public SqlSessionFactory sqlSessionFactory(DataSource dataSource) { ... }
+
+@Bean
+@ConditionalOnMissingBean
+public SqlSessionTemplate sqlSessionTemplate(SqlSessionFactory sqlSessionFactory) { ... }
+```
+
+当你在多数据源配置中手动声明了 `pgsqlSqlSessionFactory` 和 `pgsqlSqlSessionTemplate` 后：
+
+- `MybatisPlusAutoConfiguration.sqlSessionFactory()` 发现容器中已有 `SqlSessionFactory` 类型的 Bean，**跳过**。
+- `MybatisPlusAutoConfiguration.sqlSessionTemplate()` 发现容器中已有 `SqlSessionTemplate` 类型的 Bean，**跳过**。
+
+**但自动配置类仍然会被加载**，它还有其他作用：
+
+| 作用 | 说明 |
+|:---|:---|
+| **`@EnableConfigurationProperties(MybatisPlusProperties.class)`** | 绑定 `mybatis-plus.*` 配置项 |
+| **注册 `MybatisPlusInterceptor` 等扩展 Bean** | 分页、乐观锁等插件 |
+| **注册 `SqlSessionFactory` 的定制器** | 如 `ConfigurationCustomizer`、`MybatisPlusPropertiesCustomizer` |
+
+**最关键的问题**：你手动创建的 `SqlSessionFactory` 用的是什么 `FactoryBean`？
+
+- 如果用 `MybatisSqlSessionFactoryBean`（正确）：MyBatis-Plus 的动态注入功能全部生效。
+- 如果用原生的 `SqlSessionFactoryBean`（错误）：`BaseMapper` 的通用方法不会被注入，调用 `userMapper.insert()` 会报 `Invalid bound statement` 错误。
+
+---
+
+## 第六部分：多数据源实战
+
+### 6.1 问题的引出
 
 单数据源场景下，`@MapperScan` 不需要指定 `sqlSessionFactoryRef` 和 `sqlSessionTemplateRef`，因为容器里只有一个 `SqlSessionFactory` 和一个 `SqlSessionTemplate`，Spring 可以按类型自动注入。
 
 但在多数据源场景下，容器里存在多个同类型的 Bean，自动注入就会因为**类型不唯一**而报错。这时就必须显式指定。
 
-### 5.2 一个典型的多数据源配置
+### 6.2 一个典型的多数据源配置（有问题的版本）
 
 ```java
 @Configuration
@@ -648,7 +746,7 @@ public class PostgreSQLConfig {
 }
 ```
 
-### 5.3 这个配置有什么问题？
+### 6.3 这个配置有什么问题？
 
 **问题在于：没有指定 `sqlSessionTemplateRef`，也没有定义 `pgsqlSqlSessionTemplate` Bean。**
 
@@ -665,7 +763,7 @@ public class PostgreSQLConfig {
 1. **无法复用与统一管理**：每个 Mapper 都持有一个私有的 `SqlSessionTemplate`，无法享受共享 Bean 带来的内存优化和统一配置（如 `ExecutorType`）的好处。
 2. **潜在的启动失败风险**：如果容器中还存在其他 `SqlSessionTemplate` Bean，你的 Mapper 在自动注入时可能会因**类型不唯一**而导致启动失败。
 
-### 5.4 正确的多数据源配置
+### 6.4 正确的多数据源配置
 
 一个完整的多数据源配置，需要为每个数据源提供 **`DataSource`**、**`SqlSessionFactory`**、**`SqlSessionTemplate`** 和 **`TransactionManager`** 这一整套 Bean。
 
@@ -716,7 +814,7 @@ public class PostgreSQLConfig {
 }
 ```
 
-### 5.5 多数据源配置的要点
+### 6.5 多数据源配置的要点
 
 | 要点 | 说明 |
 |:---|:---|
@@ -725,11 +823,115 @@ public class PostgreSQLConfig {
 | **`@Primary` 标记主数据源** | 避免自动注入时类型不唯一 |
 | **`@Qualifier` 精确注入** | 在 Bean 方法参数上使用，避免歧义 |
 
-### 5.6 多数据源下的批量插入
+---
 
-在前文的多数据源配置中，我们为每个数据源都定义了独立的 `SqlSessionFactory` 和 `SqlSessionTemplate`。`insertBatchSomeColumn` 作为 `AbstractMethod`，同样会被注入到每个 `SqlSessionFactory` 对应的 `Configuration` 中。因此，在多数据源场景下，只要你的 Mapper 继承了自定义的 `MyBaseMapper`，批量插入方法就能正常工作。
+## 第七部分：MyBatis-Plus 批量插入实战
 
-如果你在多个数据源中使用了不同的 `SqlInjector`，也可以分别配置，互不影响。
+### 7.1 `saveBatch` 的局限：伪批量
+
+MyBatis-Plus 的 `ServiceImpl` 中提供了 `saveBatch` 方法，用起来很方便：
+
+```java
+userService.saveBatch(userList);
+```
+
+但它的底层实现是：
+
+```java
+for (T entity : entityList) {
+    sqlSession.insert(sqlStatement, entity);   // 每次都是一条独立 INSERT
+    if (i % batchSize == 0) {
+        sqlSession.flushStatements();          // 定期刷入
+    }
+}
+```
+
+**它并没有合并 SQL**，只是减少了事务提交次数。每条记录仍然是一条独立的 `INSERT` 语句，网络往返次数并没有减少。
+
+### 7.2 `rewriteBatchedStatements=true`：驱动层的"打包员"
+
+要真正提升 `saveBatch` 的性能，必须配合 JDBC 驱动参数 `rewriteBatchedStatements=true`。它的原理是：MySQL JDBC 驱动的 `executeBatchInternal()` 方法中，当 `batchHasPlainStatements == false` 且 `rewriteBatchedStatements == true` 时，会走 `executeBatchedInserts()` 路径，把多条结构相同的 `INSERT` 在内存中拼成一条多值 SQL：
+
+```sql
+INSERT INTO user (name, age) VALUES (?, ?), (?, ?), (?, ?), ...;
+```
+
+这样一次网络往返就能插入所有数据。但这种方式依赖驱动层重写，且只对 `INSERT` 等特定语句有效。
+
+### 7.3 `insertBatchSomeColumn`：真批量，动态注入的产物
+
+MyBatis-Plus 提供了一个官方扩展方法 `insertBatchSomeColumn`，它从 **SQL 生成阶段** 就直接构建多值 `INSERT`，不依赖 JDBC 驱动的重写。
+
+**它的原理**：回顾第二部分，MyBatis-Plus 通过重写 `MybatisMapperAnnotationBuilder`，在启动时遍历 `BaseMapper` 的通用方法，调用每个 `AbstractMethod` 的 `injectMappedStatement()` 方法，把生成的 `MappedStatement` 注册到 `Configuration` 中。
+
+`insertBatchSomeColumn` 正是 `AbstractMethod` 的一个子类。它的 `injectMappedStatement()` 会：
+
+1. 通过 `tableInfo.getAllInsertSqlColumnMaybeIf()` 获取列名脚本；
+2. 通过 `tableInfo.getAllInsertSqlPropertyMaybeIf()` 获取属性表达式；
+3. 拼接出带 `<foreach>` 的 SQL 模板：
+
+```sql
+INSERT INTO user (name, age) VALUES
+<foreach collection="list" item="item" separator=",">
+    (#{item.name}, #{item.age})
+</foreach>
+```
+
+4. 创建 `MappedStatement` 并注册到 `Configuration.mappedStatements` 中。
+
+运行时，MyBatis 的 `<foreach>` 标签会把 `list` 展开，**最终只生成一条多值 SQL**，一次网络往返发送给数据库。
+
+**使用示例**：
+
+**步骤 1：自定义 SQL 注入器**
+
+```java
+@Component
+public class MySqlInjector extends DefaultSqlInjector {
+    @Override
+    public List<AbstractMethod> getMethodList(Class<?> mapperClass) {
+        List<AbstractMethod> methodList = super.getMethodList(mapperClass);
+        methodList.add(new InsertBatchSomeColumn());
+        return methodList;
+    }
+}
+```
+
+**步骤 2：定义自定义 BaseMapper**
+
+```java
+public interface MyBaseMapper<T> extends BaseMapper<T> {
+    int insertBatchSomeColumn(List<T> entityList);
+}
+```
+
+**步骤 3：业务 Mapper 继承**
+
+```java
+public interface UserMapper extends MyBaseMapper<User> {}
+```
+
+**步骤 4：调用**
+
+```java
+userMapper.insertBatchSomeColumn(userList);
+```
+
+### 7.4 两种方案对比
+
+| 特性 | `saveBatch` + `rewriteBatchedStatements` | `insertBatchSomeColumn` |
+|:---|:---|:---|
+| **谁在合并** | JDBC 驱动 | MyBatis-Plus（SQL 生成阶段） |
+| **合并时机** | SQL 发送前 | SQL 生成时 |
+| **是否依赖 JDBC 参数** | 是 | 否 |
+| **SQL 形式** | 多条独立 INSERT（驱动重写） | 始终一条多值 INSERT |
+| **性能** | 中 | 高 |
+
+**一句话总结**：`saveBatch` 是"伪批量"，需要驱动帮忙才能合并；`insertBatchSomeColumn` 是"真批量"，从一开始就只生成一条 SQL。后者正是 MyBatis-Plus 动态注入机制的绝佳案例。
+
+### 7.5 多数据源下的批量插入
+
+在多数据源配置中，我们为每个数据源都定义了独立的 `SqlSessionFactory` 和 `SqlSessionTemplate`。`insertBatchSomeColumn` 作为 `AbstractMethod`，同样会被注入到每个 `SqlSessionFactory` 对应的 `Configuration` 中。因此，只要你的 Mapper 继承了自定义的 `MyBaseMapper`，批量插入方法就能正常工作。
 
 ---
 
@@ -749,8 +951,14 @@ public class PostgreSQLConfig {
 
 **Spring 集成层**：
 - `MapperFactoryBean` 实现 Spring 的 `FactoryBean`，让 Mapper 接口能作为 Bean 被注入；
+- `MapperFactoryBean.checkDaoConfig()` 调用 `configuration.addMapper()`，是连接 Spring 层和 MyBatis-Plus 增强层的关键；
 - `SqlSessionTemplate` 提供线程安全的 `SqlSession` 封装；
 - `@MapperScan` 通过 `@Import` + `ImportBeanDefinitionRegistrar` + `BeanDefinitionRegistryPostProcessor` 三个扩展点，把 Mapper 接口批量注册为 `MapperFactoryBean`。
+
+**两条路径的汇合**：
+- `MybatisPlusAutoConfiguration` 造引擎（`SqlSessionFactory`、`SqlSessionTemplate`）；
+- `@MapperScan` 装轮子（`MapperFactoryBean`）；
+- 两者通过 Spring 容器的依赖注入在 `MapperFactoryBean` 处汇合。
 
 **多数据源场景**：
 - 每个数据源需要一套完整的 `DataSource` + `SqlSessionFactory` + `SqlSessionTemplate` + `TransactionManager`；
