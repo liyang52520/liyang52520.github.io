@@ -1,8 +1,11 @@
 ---
 title: Spring中Mybatis、MybatisPlus是怎么样结合工作的？
 date: 2026-09-10 15:29:29
-tags: spring;mybatis;
-categories: develop
+tags: 
+  - spring
+  - mybatis
+categories: 
+  - develop
 ---
 
 ## 引子：一个常见的困惑
