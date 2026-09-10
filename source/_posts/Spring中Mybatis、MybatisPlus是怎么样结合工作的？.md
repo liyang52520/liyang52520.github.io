@@ -764,6 +764,8 @@ public class PostgreSQLConfig {
 1. **无法复用与统一管理**：每个 Mapper 都持有一个私有的 `SqlSessionTemplate`，无法享受共享 Bean 带来的内存优化和统一配置（如 `ExecutorType`）的好处。
 2. **潜在的启动失败风险**：如果容器中还存在其他 `SqlSessionTemplate` Bean，你的 Mapper 在自动注入时可能会因**类型不唯一**而导致启动失败。
 
+- **如果两者同时指定**：启动后会提示` Cannot use both: sqlSessionTemplate and sqlSessionFactory together. sqlSessionFactory is ignored.`，所以，最佳实践是只指定``sqlSessionTemplateRef``
+
 ### 6.4 正确的多数据源配置
 
 一个完整的多数据源配置，需要为每个数据源提供 **`DataSource`**、**`SqlSessionFactory`**、**`SqlSessionTemplate`** 和 **`TransactionManager`** 这一整套 Bean。
@@ -771,8 +773,7 @@ public class PostgreSQLConfig {
 ```java
 @Configuration
 @MapperScan(
-    sqlSessionFactoryRef = "pgsqlSqlSessionFactory",
-    sqlSessionTemplateRef = "pgsqlSqlSessionTemplate",  // 1. 显式指定要使用的模板
+    sqlSessionTemplateRef = "pgsqlSqlSessionTemplate",  // 显式指定要使用的模板
     basePackages = {
         "com.chinamobile.cmss.gzzx.framework.base.mapper",
         "com.chinamobile.cmss.gzzx.cmdb.console.mapper.postgresql"
@@ -820,7 +821,7 @@ public class PostgreSQLConfig {
 | 要点 | 说明 |
 |:---|:---|
 | **每个数据源一套完整 Bean** | `DataSource` + `SqlSessionFactory` + `SqlSessionTemplate` + `TransactionManager` |
-| **`@MapperScan` 显式引用** | 同时指定 `sqlSessionFactoryRef` 和 `sqlSessionTemplateRef`，明确绑定 |
+| **`@MapperScan` 显式引用** | 指定  `sqlSessionTemplateRef`，明确绑定 |
 | **`@Primary` 标记主数据源** | 避免自动注入时类型不唯一 |
 | **`@Qualifier` 精确注入** | 在 Bean 方法参数上使用，避免歧义 |
 
