@@ -69,13 +69,19 @@ Spring Boot 启动
 
 **关键点**：Nacos 的连接信息（`server-addr`、`password` 等）必须在**引导阶段就能拿到**，否则根本连不上服务器。这就是为什么它们通常写在 `bootstrap.yml` 里——这个文件的加载时机足够早。
 
+如果需要细究的话，就是 Nacos 实现了 NacosPropertySourceLocator
+
+而 PropertySourceLocator 会被 PropertySourceBootstrapConfiguration 在 prepareContext 阶段调用（PropertySourceBootstrapConfiguration 继承了 ApplicationContextInitializer）
+
+这个阶段可以看一下 Spring Boot 启动时的文章，大致是 createEnvironment -> createContext -> prepareContext -> refreshContext
+
 ### 2. 启动后的动态刷新
 
 配置拉下来之后不是就完事了。Nacos 客户端会和服务端保持一个**长轮询（Long Polling）** 通道（新版使用Grpc长连接，对后续理解无影响）：
 
 - 客户端不断问服务端："我关心的这些配置变了吗？"
 - 没变就挂起等待；变了就立即把新配置拉回来
-- 更新本地 `Environment` 和 `@RefreshScope` 的 Bean
+- 更新本地 `Environment` 和 `@RefreshScope` 的 Bean（对于`@RefreshScope`注解的理解和使用，可以单开一篇文章了，现在只需要知道`@RefreshScope`标注的 bean，会在收到配置更新时间后刷新）
 
 这就是你在 Nacos 控制台改完配置、刷新一下页面就能看到效果的原因。
 
