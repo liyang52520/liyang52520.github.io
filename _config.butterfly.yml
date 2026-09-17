@@ -156,7 +156,7 @@ toc:
   # 是否在独立页面显示目录
   page: false
   # 目录是否带序号
-  number: true
+  number: false
   # 目录是否默认展开
   expand: false
   # 是否使用简洁风格的目录（仅文章页生效）
