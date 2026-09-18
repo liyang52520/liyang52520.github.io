@@ -24,16 +24,16 @@ nav:
 # 以 / 结尾的链接会自动匹配当前路径高亮
 menu:
   # 首页
-  Home: / || fas fa-home
+  首页: / || fas fa-home
   # 归档页
-  Archives: /archives/ || fas fa-archive
+  归档: /archives/ || fas fa-archive
   # 标签页
-  Tags: /tags/ || fas fa-tags
+  标签: /tags/ || fas fa-tags
   # 分类页
-  Categories: /categories/ || fas fa-folder-open
+  分类: /categories/ || fas fa-folder-open
   # 关于页（当前被注释掉，需要时取消 # 即可）
   # 注意: 要先执行 npx hexo new page "about" 创建页面
-  # About: /about/ || fas fa-heart
+  # 关于: /about/ || fas fa-heart
 
 # --------------------------------------
 # 代码块设置
