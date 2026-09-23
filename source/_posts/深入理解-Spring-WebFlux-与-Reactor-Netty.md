@@ -1,5 +1,5 @@
 ---
-title: 深入理解 Spring WebFlux 与 Reactor Netty
+title: 深入理解 Spring WebFlux 与 Reactor Netty：从 Tomcat 到 EventLoop 的思维跃迁
 date: 2026-09-15 17:48:04
 tags:
   - spring
@@ -26,9 +26,7 @@ Spring MVC 的请求路径非常直观：
 
 这个模型可以概括为：**一个请求，一个线程，从头跑到尾。**
 
-换成 Spring WebFlux + Reactor Netty 之后，这些角色似乎消失了。
-
-没有 Tomcat，没有 Servlet，没有 `DispatcherServlet`。取而代之的是：
+换成 Spring WebFlux + Reactor Netty 之后，这些角色似乎消失了。取而代之的是：
 
 - `EventLoop`
 - `Channel`
@@ -40,6 +38,8 @@ Spring MVC 的请求路径非常直观：
 这篇文章始终拿 Tomcat 作为参照物。每进入一个新概念，先回答一个问题：
 
 > 如果是 Tomcat，这里会是谁？现在换成了谁？
+
+通过这种方式，新概念可以被挂到已有的知识树上，而不是孤立地堆砌。
 
 ---
 
@@ -107,7 +107,7 @@ Netty 想解决的就是这个问题。它不是"加更多线程"，而是换一
 ```java
 while (true) {
     // 阻塞等待 IO 事件
-    select();
+    selector.select();
 
     // 处理所有就绪的 Channel
     for (Channel channel : readyChannels) {
@@ -528,109 +528,19 @@ public Mono<String> hello() {
 
 整个过程中，所有操作都在同一个 EventLoop 线程上完成。没有线程切换。
 
+这就是同步、非阻塞的 WebFlux 请求。
+
+但这个例子太简单了。它的最上游 Publisher 是 `Mono.just("hello")`——数据就在内存里，压根没有异步的成分。
+
+现实中的请求，往往需要访问外部服务。这时候，整条链路的行为就完全不同了。
+
 ---
 
-## 七、Publisher 与 Subscriber：理解异步请求的前提
+## 七、异步请求：从一行代码到一次完整的往返
 
-在讲异步请求之前，必须先补上 Reactor 的两个核心概念：**Publisher** 和 **Subscriber**。
+### 7.1 场景：Controller 里调用了其他服务
 
-前面已经多次出现 `Mono`、`subscribe` 这些词，但一直没有正式解释它们。这里一次性讲清楚。
-
-### 7.1 Mono 和 Flux 是 Publisher
-
-在 Reactor 里，`Mono<T>` 和 `Flux<T>` 都实现了同一个接口：
-
-```java
-public interface Publisher<T> {
-    void subscribe(Subscriber<? super T> s);
-}
-```
-
-所以：
-
-- **`Mono<String>` 是一个 Publisher**，它承诺：订阅之后，会发出 0 或 1 个 String。
-- **`Flux<String>` 是一个 Publisher**，它承诺：订阅之后，会发出 0 到 N 个 String。
-
-Publisher 本身不干活。它只是一份"剧本"，描述了"如果有人订阅我，我会发出什么"。
-
-### 7.2 Subscriber 是订阅者
-
-`Subscriber` 是另一个接口：
-
-```java
-public interface Subscriber<T> {
-    void onSubscribe(Subscription s);
-    void onNext(T t);
-    void onError(Throwable t);
-    void onComplete();
-}
-```
-
-一个 Subscriber 就是一个"接收数据的人"。它定义了四件事：
-
-- `onSubscribe`：订阅关系建立时被调用，拿到一个 `Subscription`（可以理解为"请求更多数据"的凭据）。
-- `onNext`：每收到一个数据时被调用。
-- `onError`：发生错误时被调用。
-- `onComplete`：数据发完时被调用。
-
-### 7.3 subscribe() 把两者连起来
-
-当调用：
-
-```java
-publisher.subscribe(subscriber);
-```
-
-Publisher 就开始工作，并通过上面四个方法，向 Subscriber 发信号。
-
-**这就是 Reactor 的全部模型：**
-
-> Publisher 是"数据源"，Subscriber 是"数据接收者"，`subscribe` 把两者连接起来。连接之后，Publisher 通过 `onNext` / `onError` / `onComplete` 三个信号，向 Subscriber 推送数据。
-
-### 7.4 每个操作符都会产生一对新的 Publisher/Subscriber
-
-这才是最容易让人糊涂的地方。
-
-当你写：
-
-```java
-webClient.get().uri(...).retrieve().bodyToMono(String.class)
-```
-
-这一串链式调用**不是**一个 Publisher。它是**一串** Publisher。
-
-每个操作符（`get`、`uri`、`retrieve`、`bodyToMono`）都会产生一个新的 Publisher，包装前一个。
-
-结构如下：
-
-```text
-bodyToMono(String.class)   ← 最下游 Publisher
-      ↑ 包装
-retrieve()                 ← 上游 Publisher
-      ↑ 包装
-uri(...)                   ← 更上游 Publisher
-      ↑ 包装
-get()                      ← 最上游 Publisher
-```
-
-当你对这个链条的最下游 Publisher 调用 `subscribe(subscriber)` 时，会发生什么？
-
-**订阅信号会一层一层往上传播**：
-
-1. 最下游 Publisher 收到订阅，它调用自己上游 Publisher 的 `subscribe`，并把自己包装成一个 Subscriber 传进去。
-2. 上游 Publisher 收到订阅，又调用它的上游 Publisher 的 `subscribe`，再包装一个 Subscriber 传进去。
-3. 一直传最上游。
-4. 最上游开始干活（比如发起 HTTP 请求）。当数据产生时，通过 Subscriber 链，把数据一层一层往下游推。
-
-所以，**每个 Publisher 都对应一个 Subscriber**。它们成对出现，串成一条链。
-
-这就是为什么前面说：
-
-> 订阅链，实际上是一串 Publisher 和一串 Subscriber，一一对应地连接起来。
-
-### 7.5 回到异步请求
-
-现在回头看异步请求里发生的事：
+假设 Controller 里用 WebClient 调用另一个服务：
 
 ```java
 @GetMapping("/hello")
@@ -642,62 +552,453 @@ public Mono<String> hello() {
 }
 ```
 
-`hello()` 返回的，是这个链条的**最下游 Publisher**。它是一个 `Mono<String>`。
+先不急着深入代码。先在脑子里过一遍几个问题：
 
-当 Reactor Netty 在 `ChannelOperationsHandler` 里对它调用 `subscribe()` 时：
+- 这段代码看起来是"顺序执行"的，但真的是这样吗？
+- 它调用了 other-service，Server EventLoop 会被阻塞吗？
+- other-service 的响应回来时，谁来处理？
+- 处理完后，怎么把结果写回浏览器？
 
-1. 订阅信号沿着链条往上传播，一层一层建立 Publisher/Subscriber 配对。
-2. 最上游的 Publisher 被激活，从连接池拿 ClientChannel，把 HTTP 请求写出去。
-3. 同时在 ClientChannel 的 Pipeline 上，注册一个 `ResponseHandler`。
-4. `ResponseHandler` 里保存的，正是这条订阅链上**最上游的那个 Subscriber**。
+这四个问题，是理解整条异步链路的关键。
 
-当响应到达时：
+### 7.2 第一个问题：这段代码不是"顺序执行"的
 
-1. ClientChannel 的 EventLoop 唤醒。
-2. `ResponseHandler.channelRead` 被调用。
-3. 它调用保存的那个 Subscriber 的 `onNext(data)`。
-4. 数据沿着 Subscriber 链，一层一层往下游传。
-5. 每经过一层，对应的操作符执行自己的逻辑（比如 `bodyToMono` 会把 `ByteBuf` 转成 `String`）。
-6. 最终到达链条末端——WebFlux 在 `subscribe()` 时挂上去的那个 Subscriber。
+很多人第一眼看到：
 
-链条末端的那个 Subscriber 是什么？
+```java
+return webClient.get()
+        .uri("http://other-service/api")
+        .retrieve()
+        .bodyToMono(String.class);
+```
 
-它是在 `ChannelOperationsHandler` 调用 `subscribe()` 时创建的。它做的事很简单：把数据写回响应。
+会下意识地理解成三段顺序执行的代码：
 
-伪代码：
+1. `get().uri().retrieve()`：发起请求。
+2. `bodyToMono(String.class)`：处理响应。
+3. `return`：返回结果。
+
+**这个理解是错的。**
+
+在 Reactor 中，这一整段链式调用，在 Controller 方法返回时，**一行都没执行**。
+
+它只是构建了一个 `Mono`——一个描述"将来要做什么"的对象。
+
+在这个阶段：
+
+- 没有连接 other-service。
+- 没有发送 HTTP 请求。
+- 没有注册任何回调。
+- 没有分配任何线程。
+
+它只是一份**蓝图**。
+
+真正让蓝图变成行动的，是订阅。
+
+### 7.3 subscribe 是分界线
+
+Reactor Netty 在 `ChannelOperationsHandler` 里对 WebFlux 返回的 `Mono` 调用了 `subscribe()`。
+
+这一行，就是"启动引擎"的动作。
+
+但 `subscribe()` 到底做了什么？要回答这个问题，必须先理解响应式流模型。
+
+### 7.4 前置知识：响应式流的五个角色和四个信号
+
+Reactive Streams 规范定义了五个关键角色：
+
+| 角色 | 通俗理解 | 代码中 |
+|---|---|---|
+| Publisher | 数据源，负责生产数据 | `Flux` / `Mono` |
+| Subscriber | 消费者，负责接收数据 | `subscribe(...)` 里的 Lambda 被包装成它 |
+| Subscription | 订阅凭证，连接生产者和消费者 | 包含 `request` 和 `cancel` |
+| `request` | 消费者说：我要几个数据 | `subscription.request(n)` |
+| `onNext` | 生产者说：给你一个数据 | `subscriber.onNext(data)` |
+
+还有几个关键信号：
+
+- `onSubscribe`：生产者把订阅凭证交给消费者。
+- `onNext`：生产者发一个数据。
+- `onComplete`：数据发完了。
+- `onError`：出错了。
+
+这些信号的方向非常重要：
+
+```text
+消费者 Subscriber                数据源 Publisher
+      |                                |
+      |---- subscribe(subscriber) --->|  我要订阅你
+      |                                |
+      |<--- onSubscribe(subscription)--|  给你订阅凭证
+      |                                |
+      |---- subscription.request(n) -->|  我要 n 个数据
+      |                                |
+      |<--- onNext(data1) -------------|  给你一个
+      |<--- onNext(data2) -------------|  再给你一个
+      |<--- onComplete() --------------|  发完了
+```
+
+记住：
+
+- `subscribe`、`request` 这两个动作，从**下游往上游**走。
+- `onSubscribe`、`onNext`、`onComplete`、`onError` 这四个信号，从**上游往下游**走。
+
+**一个默认行为要记住**：`subscribe(Consumer)` 这类方法，内部会帮你调用 `subscription.request(Long.MAX_VALUE)`。意思是"有多少给我多少，我不做背压控制"。这就是为什么后面看到"request 被调用"时，其实就是"启动了数据发射"。
+
+### 7.5 一个操作符，一对新的 Publisher/Subscriber
+
+但事情没有那么简单。
+
+刚才那行代码：
+
+```java
+webClient.get()
+        .uri("http://other-service/api")
+        .retrieve()
+        .bodyToMono(String.class)
+```
+
+它**不是**一个 Publisher。它是**一串** Publisher。
+
+每个操作符（`get`、`uri`、`retrieve`、`bodyToMono`）都会产生一个新的 Publisher，包装前一个：
+
+```text
+bodyToMono(String.class)   ← 最下游 Publisher
+      ↑ 包装
+retrieve()                 ← 上游 Publisher
+      ↑ 包装
+uri(...)                   ← 更上游 Publisher
+      ↑ 包装
+get()                      ← 最上游 Publisher
+```
+
+装配阶段构造的，就是这条 **Publisher 链**。每个 Publisher 都持有它的上游。
+
+而订阅阶段，会构造一条方向相反的 **Subscriber 链**。订阅信号从最下游往上传播，每经过一个 Publisher，就创建一个包装下游 Subscriber 的新 Subscriber：
+
+```text
+最上游 Publisher
+     │ 对应
+     ↓
+Subscriber A  （由最上游 Publisher 创建，包装下游）
+     │ 持有下游
+     ↓
+Subscriber B  （由上游 Publisher 创建，包装下游）
+     │ 持有下游
+     ↓
+Subscriber C  （由下游 Publisher 创建，包装下游）
+     │ 持有下游
+     ↓
+末端 Subscriber（由 subscribe(...) 传入的 Lambda 包装而来）
+```
+
+每个 Publisher 都对应一个 Subscriber。两条链，方向相反，一一对应。
+
+**数据流动的方向**：从最上游 Publisher 出发，沿 Subscriber 链往下游传。
+
+数据经过每一层 Subscriber 时，对应的操作符逻辑就会执行一次。比如 `map` 对应的 Subscriber 会把数据加工一下再传给下游。
+
+### 7.6 同步源的 subscribe：Flux.just 走一遍
+
+先看一个最朴素的同步例子：
+
+```java
+Flux.just("A", "B")
+    .subscribe(System.out::println);
+
+System.out.println("subscribe 返回");
+// 输出：
+// A
+// B
+// subscribe 返回
+```
+
+数据先被打印，然后才是"subscribe 返回"。这说明 **subscribe() 返回时，整条链已经跑完了**。
+
+为什么？因为 `Flux.just` 底层是 `FluxArray`，它的数据就在内存数组里，行为是同步发射。用伪代码模拟一下 `FluxArray` 的行为：
+
+```java
+class JustPublisher implements Publisher<String> {
+    String[] data = {"A", "B"};
+
+    public void subscribe(Subscriber<String> subscriber) {
+        Subscription subscription = new Subscription() {
+            boolean done = false;
+
+            public void request(long n) {
+                for (String d : data) {
+                    if (!done) {
+                        subscriber.onNext(d);
+                    }
+                }
+                done = true;
+                subscriber.onComplete();
+            }
+
+            public void cancel() {
+                done = true;
+            }
+        };
+
+        subscriber.onSubscribe(subscription);
+    }
+}
+```
+
+`subscriber.onSubscribe(...)` 被调用时，Subscriber 会去调 `subscription.request(Long.MAX_VALUE)`。而这个 `request` 方法里做的事情，就是**当场循环发射**：`onNext("A")`、`onNext("B")`、`onComplete()`。
+
+所以整个执行顺序是：
+
+1. 消费者调用 `JustPublisher.subscribe(...)`。
+2. `JustPublisher` 创建 `Subscription`，调用 `subscriber.onSubscribe(subscription)`。
+3. Subscriber 在 `onSubscribe` 里调用 `subscription.request(MAX)`。
+4. `request` 当场发完数据，包括 `onComplete()`。
+5. `subscribe()` 返回。
+
+**subscribe() 返回时，数据已经处理完了。**
+
+### 7.7 异步源的 subscribe：WebClient 走一遍
+
+再看异步源。用 `Mono.fromFuture` 做例子：
+
+```java
+CompletableFuture<String> future = CompletableFuture.supplyAsync(() -> {
+    sleep(1000);
+    return "Hello";
+});
+
+Mono.fromFuture(future)
+    .subscribe(System.out::println);
+
+System.out.println("subscribe 返回");
+// 输出：
+// subscribe 返回
+// （一秒后）
+// Hello
+```
+
+顺序反了。为什么？
+
+关键在异步源的 `request` **不立即发数据**。它做的事情，只是"登记需求 + 注册回调"。用伪代码模拟：
+
+```java
+class FutureSubscription<T> implements Subscription {
+    Subscriber<? super T> actual;
+    CompletableFuture<T> future;
+    volatile long requested;
+    volatile boolean cancelled;
+
+    public void request(long n) {
+        requested = n;
+
+        if (future.isDone()) {
+            emit();
+        } else {
+            future.whenComplete((value, error) -> {
+                if (cancelled) return;
+                if (error != null) {
+                    actual.onError(error);
+                } else {
+                    if (requested > 0) {
+                        actual.onNext(value);
+                        actual.onComplete();
+                    }
+                }
+            });
+        }
+    }
+
+    public void cancel() {
+        cancelled = true;
+    }
+}
+```
+
+看 `request` 方法：
+
+- 如果 Future 已经完成，直接发。
+- 如果 Future 没完成，**只注册一个 `whenComplete` 回调，然后返回**。
+
+所以 subscribe 的执行顺序是：
+
+1. 消费者调用 `FuturePublisher.subscribe(...)`。
+2. `FuturePublisher` 创建 `FutureSubscription`，调用 `subscriber.onSubscribe(fs)`。
+3. Subscriber 调用 `fs.request(MAX)`。
+4. `request` 发现 Future 没完成，**注册一个回调**，然后返回。
+5. `subscribe()` 返回。
+
+**subscribe() 返回时，响应还没到，数据还没产生。**
+
+一秒钟后，Future 完成。`whenComplete` 回调在**完成 Future 的那个线程**上被触发：
+
+```java
+actual.onNext("Hello");
+actual.onComplete();
+```
+
+数据从这一刻起，才开始沿 Subscriber 链向下游流动。
+
+**把 WebClient 套进这个模型，就是同样的道理。** WebClient 的 Publisher 在 `request` 时做的事情，本质上和上面一样：不是"当场发数据"，而是"发起 HTTP 请求 + 在 ClientChannel 的 Pipeline 上注册一个 ResponseHandler"。
+
+`request` 返回，`subscribe` 返回，Server EventLoop 回到循环。**响应什么时候到，由 Client EventLoop 通过 `select()` 感知。**
+
+### 7.8 subscribe 到底阻不阻塞？
+
+到这里，可以回答一个最常见的问题了：
+
+> **subscribe() 是不是阻塞的？**
+
+准确的答案是一句话：
+
+> **subscribe() 本身不阻塞。但如果数据源是同步的，它会在当前线程一直执行到 `onComplete` 才返回。如果是异步的，它会注册回调后立即返回。**
+
+用一个对比表把它说清楚：
+
+| 对比点 | 同步源 | 异步源 |
+|---|---|---|
+| 例子 | `Flux.just`、`Flux.range` | `Mono.fromFuture`、`Flux.interval`、WebClient |
+| `subscribe` 调用线程 | 常常跑完整条流才返回 | 通常只注册回调/启动任务就返回 |
+| `request` 做什么 | 当场循环发数据 | 登记需求、注册回调、启动定时任务、发起 IO |
+| `onNext` 在哪个线程 | 调用 `subscribe` 的线程 | 异步线程、调度器线程、Netty 线程 |
+| `subscribe` 返回时 | 数据通常已经发完 | 数据通常还没到 |
+| 是否占住调用线程 | 是，直到完成 | 通常不占，快速返回 |
+
+真正的显式阻塞是 `block()` / `blockLast()`。`subscribe()` 不是这个语义。
+
+**一句话概括**：
+
+> **subscribe 是"触发执行"，不是"等待执行"。但同步源会让"触发过程"本身就执行完，从而占住调用线程。**
+
+### 7.9 分水岭：NIO 与 BIO
+
+现在回到那个关键问题：
+
+> **为什么 WebClient 可以"注册回调后立即返回"，而 RestTemplate 不行？**
+
+答案不在 API 层，也不在 Mono 这一层。答案在**操作系统的 IO 模型**里。
+
+**RestTemplate 用的是 BIO（阻塞 IO）。**
+
+```java
+String result = restTemplate.getForObject("http://other-service/api", String.class);
+```
+
+这行代码背后，当前线程做的是：
+
+```java
+socket.getOutputStream().write(requestBytes);  // 写请求
+socket.getOutputStream().flush();
+
+byte[] responseBytes = readFully(socket.getInputStream());
+//    ↑ 关键：当前线程在这里阻塞。
+//      数据还没到，操作系统就把线程挂起。
+//      线程从"运行"变成"等待"，什么都做不了。
+//      直到响应到达，操作系统才把它唤醒。
+```
+
+BIO 的 `read()` 是阻塞的。没有数据，线程就挂起。**线程必须亲自去读，读了就得等。**
+
+**WebClient 用的是 NIO（非阻塞 IO）。**
+
+最上游 Publisher 做的是：
+
+```java
+channel.writeAndFlush(requestBytes);   // 写请求
+
+channel.pipeline().addLast(new ResponseHandler(callback));
+//    ↑ 关键：注册一个 Handler，不读。
+
+return;  // 立即返回
+```
+
+它没有调用任何阻塞的 `read()`。它注册完 Handler，就返回了。
+
+那么响应什么时候被读？答案是：**由 EventLoop 在未来的某个时刻，通过 `select()` 感知到"这个 Channel 有数据可读"，然后代它读。**
+
+**分水岭就在这里：**
+
+> **BIO 的 read() 会阻塞线程，所以线程必须亲自等。**
+>
+> **NIO 的 read() 不阻塞，响应的读取交给 `select()` 通知，所以线程可以注册完 Handler 就走。**
+
+Mono 和 `subscribe()` 只是把 NIO 的这个能力，包装成了"订阅式 API"的样子。真正决定同步还是异步的，是底层的 IO 模型。
+
+**一个常见的误解**：
+
+有人以为"WebClient 是异步的，是因为它返回 Mono"。
+
+这是错的。如果把一个阻塞的 RestTemplate 调用包在一个 Mono 里：
+
+```java
+Mono<String> fakeAsync() {
+    return Mono.fromCallable(() -> restTemplate.getForObject(...));
+}
+```
+
+它确实返回了 Mono。但 `subscribe()` 之后，还是会一路走到阻塞的 `read()`。它只是把阻塞"藏"在了另一个地方。
+
+**Mono 不是异步的原因，NIO 才是。**
+
+### 7.10 响应到达：回调触发，数据开始流动
+
+other-service 的响应回来了。
+
+它的字节到达的是 **ClientChannel 绑定的那个 EventLoop**。
+
+因为这个 Channel 的所有 IO 事件只能由它绑定的 EventLoop 处理。
+
+于是：
+
+- 这个 EventLoop 在自己的 `while(true)` 中 `select()` 到数据可读。
+- 它读取字节，解码成 HTTP 响应。
+- 它触发 ClientChannel 的 Pipeline。
+- 它走到 `ResponseHandler.channelRead`。
+- `ResponseHandler` 调用它保存的那个最上游 Subscriber 的 `onNext(data)`。
+
+"触发回调"听起来很神秘，但实际上就是一次普通的方法调用：
+
+```java
+callback.onNext(responseData);
+```
+
+没有魔法。只是另一个 EventLoop 线程在它的循环中执行了这一行代码。
+
+从这一刻起，数据开始沿 Subscriber 链往下游流动。这就是 `.bodyToMono(String.class)` 真正执行的地方：
+
+- 它把响应体（`ByteBuf` / `DataBuffer`）转换成 `String`。
+- 然后把 String 交给下游的 Subscriber。
+
+**这一步跑在 ClientChannel 的 EventLoop 上。**
+
+`.bodyToMono(String.class)` 是在装配阶段就"就位"的一节。它执行的时间点是"响应到达，数据流经它的时候"。它执行的环境是 ClientChannel 的 EventLoop。
+
+### 7.11 数据怎么流回 ServerChannel：靠的是"记"，不是"找"
+
+数据一节一节地沿着 Subscriber 链往下游走。最终会到达链的末端。
+
+链的末端是什么？是 **WebFlux 在订阅 Controller 返回的 Mono 时挂上去的那个末端 Subscriber**。
+
+这个末端 Subscriber 是在什么时候挂上去的？
+
+在 `ChannelOperationsHandler` 调用 `subscribe()` 的那一刻，WebFlux 内部会做这样一件事：
 
 ```java
 Mono<Void> result = handler.handle(exchange);
 
-result.subscribe(new Subscriber<String>() {
-    @Override
-    public void onSubscribe(Subscription s) { s.request(Long.MAX_VALUE); }
-
-    @Override
-    public void onNext(String data) {
-        // 把 data 写回响应
-        exchange.getResponse().writeWith(...);
-    }
-
-    @Override
-    public void onError(Throwable t) {
-        exchange.getResponse().setComplete();
-    }
-
-    @Override
-    public void onComplete() {
-        exchange.getResponse().setComplete();
-    }
-});
+result.subscribe(
+    data -> writeBackToServer(exchange, data),
+    error -> handleError(exchange, error),
+    () -> completeResponse(exchange)
+);
 ```
 
 注意这里的 `exchange`。
 
-它是**闭包捕获**的。换句话说：
+它是一个被闭包捕获的变量。换句话说：
 
-> 在装配阶段，WebFlux 就把 `ServerWebExchange` 塞进了末端 Subscriber 的闭包里。这个 `ServerWebExchange` 内部持有 `ServerHttpResponse`，`ServerHttpResponse` 内部持有 ServerChannel。
+> 在装配阶段，WebFlux 就已经把 `ServerWebExchange` 塞进了末端 Subscriber 的闭包里。这个 `ServerWebExchange` 内部持有 `ServerHttpResponse`，`ServerHttpResponse` 内部持有 ServerChannel。
 
-当数据到达链条末端时，末端 Subscriber 用闭包里早就记着的 `exchange`，把数据写回去：
+于是，当数据最终流到链的末端时，末端 Subscriber 不需要"找" ServerChannel。它只需要用自己闭包里早就记着的 `exchange`，把数据写回去：
 
 ```java
 exchange.getResponse().writeWith(...);
@@ -707,69 +1008,11 @@ exchange.getResponse().writeWith(...);
 
 **一句话总结**：
 
-> 数据流回 ServerChannel，靠的不是"找"，而是"记"。WebFlux 在装配阶段就把 `ServerWebExchange` 记进了链条末端 Subscriber 的闭包里。数据到达末端时，末端 Subscriber 自然知道该往哪里写。
+> 数据流回 ServerChannel，靠的不是"找"，而是"记"。WebFlux 在装配阶段就把 `ServerWebExchange` 记进了链条末端 Subscriber 的闭包里。数据到达末端时，末端自然知道该往哪里写。
 
----
+用一个比喻：这就像寄快递。寄件的时候，收件地址就已经写在单子上了。包裹在路上怎么辗转，都不影响单子上已经写好的收件地址。到了末端，直接按单子上的地址投递即可。
 
-## 八、异步请求的完整时间线
-
-把前面所有内容串成一条时间线。每一步都标注"跑在哪个线程"。
-
-```text
-时刻   发生了什么                                             跑在哪个线程
-──────────────────────────────────────────────────────────────────────────────
-T0    浏览器请求到达 ServerChannel                           Server EventLoop
-      │
-T1    ServerChannel 的 Pipeline 触发                          Server EventLoop
-      │
-T2    ChannelOperationsHandler 调用 WebFlux 的 HttpHandler     Server EventLoop
-      │
-T3    WebFlux 层层处理，进入 Controller                        Server EventLoop
-      │
-T4    Controller 返回 Mono（Publisher 链，什么都没执行）        Server EventLoop
-      │
-T5    Reactor Netty 对 Mono 调用 subscribe()                  Server EventLoop
-      │
-T6    订阅信号沿 Publisher 链向上传播，逐层建立 Subscriber 配对  Server EventLoop
-      │
-T7    最上游 Publisher 拿 ClientChannel，写入请求，             Server EventLoop
-      注册 ResponseHandler（内部保存最上游 Subscriber）
-      │
-T8    装配完成，EventLoop 回到 while(true)                    Server EventLoop
-      │
-      │   ... 线程继续处理其他 Channel，没有阻塞 ...
-      │
-T9    ClientChannel 上的响应到达，select() 唤醒               Client EventLoop
-      │
-T10   ClientChannel 的 Pipeline 触发                          Client EventLoop
-      │
-T11   ResponseHandler 调用最上游 Subscriber 的 onNext          Client EventLoop
-      │
-T12   onNext 信号沿 Subscriber 链向下游传播，                   Client EventLoop
-      bodyToMono 等操作符在这时执行
-      │
-T13   到达末端 Subscriber，用闭包捕获的 exchange 写回           Client EventLoop
-      │
-T14   serverChannel.writeAndFlush(data)                       Client EventLoop
-      │
-T15   writeAndFlush 检查 eventLoop：                           —
-      │   - 如果 Client EventLoop == Server EventLoop：直接写
-      │   - 否则：把写任务排进 Server EventLoop 的队列
-      │
-T16   Server EventLoop 执行写任务，数据发送给浏览器             Server EventLoop
-```
-
-**关键点回顾**：
-
-- T6 到 T8 之间，没有任何线程被阻塞。
-- `.bodyToMono(String.class)` 是 T12 执行的，跑在 Client EventLoop 上。
-- T13 写回响应，靠的是末端 Subscriber 闭包捕获的 `exchange`，不需要"找" ServerChannel。
-- T14 的 `writeAndFlush` 会在 T15 决定是否要调度回 Server EventLoop。
-- T16 数据真正发送给浏览器。
-
----
-
-## 九、`writeAndFlush`：Netty 是怎么把数据真正发出去的
+### 7.12 最后一公里：writeAndFlush
 
 `ServerHttpResponse.writeWith(...)` 最终会调用：
 
@@ -815,9 +1058,64 @@ if (eventLoop.inEventLoop()) {
 
 **"回到原 EventLoop"的真正含义**：不是数据"找"回去了，而是 `writeAndFlush` 内部帮你把任务排进了正确的队列。
 
----
+### 7.13 整条时间线
 
-## 十、为什么常常不需要线程切换
+把上面所有步骤串成一条时间线。每一步都标注"跑在哪个线程"。
+
+```text
+时刻   发生了什么                                             跑在哪个线程
+──────────────────────────────────────────────────────────────────────────────
+T0    浏览器请求到达 ServerChannel                           Server EventLoop
+      │
+T1    ServerChannel 的 Pipeline 触发                          Server EventLoop
+      │
+T2    ChannelOperationsHandler 调用 WebFlux 的 HttpHandler     Server EventLoop
+      │
+T3    WebFlux 层层处理，进入 Controller                        Server EventLoop
+      │
+T4    Controller 返回 Mono（Publisher 链，什么都没执行）        Server EventLoop
+      │
+T5    Reactor Netty 对 Mono 调用 subscribe()                  Server EventLoop
+      │
+T6    订阅信号沿 Publisher 链向上传播，逐层建立 Subscriber 配对  Server EventLoop
+      │
+T7    最上游 Publisher 拿 ClientChannel，写入请求，             Server EventLoop
+      注册 ResponseHandler（内部保存最上游 Subscriber）
+      │
+T8    subscribe() 在异步边界处返回，EventLoop 回到 while(true)  Server EventLoop
+      │
+      │   ... 线程继续处理其他 Channel，没有阻塞 ...
+      │
+T9    ClientChannel 上的响应到达，select() 唤醒               Client EventLoop
+      │
+T10   ClientChannel 的 Pipeline 触发                          Client EventLoop
+      │
+T11   ResponseHandler 调用最上游 Subscriber 的 onNext          Client EventLoop
+      │
+T12   onNext 信号沿 Subscriber 链向下游传播，                   Client EventLoop
+      bodyToMono 等操作符在这时执行
+      │
+T13   到达末端 Subscriber，用闭包捕获的 exchange 写回           Client EventLoop
+      │
+T14   serverChannel.writeAndFlush(data)                       Client EventLoop
+      │
+T15   writeAndFlush 检查 eventLoop：                           —
+      │   - 如果 Client EventLoop == Server EventLoop：直接写
+      │   - 否则：把写任务排进 Server EventLoop 的队列
+      │
+T16   Server EventLoop 执行写任务，数据发送给浏览器             Server EventLoop
+```
+
+**关键点回顾**：
+
+- T5 到 T8 之间，subscribe() 执行了装配，遇到异步边界后返回。
+- T8 到 T9 之间，没有任何线程被阻塞。
+- `.bodyToMono(String.class)` 是 T12 执行的，跑在 Client EventLoop 上。
+- T13 写回响应，靠的是末端 Subscriber 闭包捕获的 `exchange`，不需要"找" ServerChannel。
+- T14 的 `writeAndFlush` 会在 T15 决定是否要调度回 Server EventLoop。
+- T16 数据真正发送给浏览器。
+
+### 7.14 为什么常常不需要线程切换
 
 Server EventLoop 和 Client EventLoop 不一定是不同线程。
 
@@ -846,6 +1144,72 @@ Reactor Netty 还提供了共址机制。在某些集成场景中，当在 Serve
 
 ---
 
+## 八、在 WebFlux 里，不要手动 subscribe
+
+理解了 subscribe 的机制之后，有一条实践准则值得单独拿出来讲：
+
+> **在 Spring WebFlux 的 Controller 里，不要手动调用 `subscribe()`。**
+
+**正确写法**：
+
+```java
+@GetMapping("/users/{id}")
+public Mono<User> getUser(@PathVariable String id) {
+    return userService.findById(id)
+            .doOnNext(user -> log.info("found: {}", user));
+}
+```
+
+返回 `Mono` 或 `Flux`。Spring WebFlux 会替你订阅：它会把你返回的 Publisher 接到 WebFlux 内部的订阅链上，`onNext` 写成 HTTP 响应体，`onComplete` 结束响应，`onError` 交给异常处理机制。
+
+**错误写法**：
+
+```java
+@GetMapping("/users/{id}")
+public Mono<User> getUser(@PathVariable String id) {
+    userService.findById(id)
+            .subscribe(user -> log.info("found: {}", user));
+
+    return Mono.empty();
+}
+```
+
+手动订阅会带来一堆问题：
+
+1. **框架无法管理响应**：结果不会自动写回 HTTP。
+2. **可能双订阅**：冷流会被执行两次。
+3. **错误丢失**：错误不会进入 WebFlux 的 `@ExceptionHandler`。
+4. **上下文丢失**：Reactor Context、安全上下文可能丢失。
+5. **资源泄漏**：请求结束或取消时，手动订阅的流可能继续运行。
+6. **可能阻塞 Netty EventLoop**：如果流中包含同步阻塞操作。
+
+需要副作用，用 `doOnNext`、`doOnError`、`doFinally`：
+
+```java
+return userService.findById(id)
+        .doOnNext(user -> log.info("found: {}", user));
+```
+
+需要组合异步操作，用 `flatMap`、`then`、`zip`、`merge`：
+
+```java
+return userService.findById(id)
+        .flatMap(user -> anotherService.doSomething(user))
+        .then();
+```
+
+测试时用 `StepVerifier`：
+
+```java
+StepVerifier.create(service.findById("1"))
+        .expectNextCount(1)
+        .verifyComplete();
+```
+
+**记住这一条**：`subscribe` 是"由框架负责"的。业务代码只负责"构建 Publisher 链"，由框架在合适的时机把它接进自己的订阅链。
+
+---
+
 ## 结语：从 Tomcat 到 Netty，思维需要一次跳跃
 
 回到最开始。
@@ -853,6 +1217,8 @@ Reactor Netty 还提供了共址机制。在某些集成场景中，当在 Serve
 在 Tomcat 里：
 
 > 一个请求，一个线程，阻塞等待，返回响应。
+>
+> 线程必须亲自去 `read()` 结果。`read()` 会阻塞线程，所以线程只能等。这就是 BIO 的宿命。
 
 在 Netty 里：
 
@@ -860,9 +1226,13 @@ Reactor Netty 还提供了共址机制。在某些集成场景中，当在 Serve
 >
 > 链式调用不是"顺序执行"，而是"构建 Publisher 链"。订阅才让 Publisher 链变成行动。
 >
-> 订阅的过程，是 Publisher 链和 Subscriber 链一一配对的过程。数据从上游 Publisher 流出，经过 Subscriber 链，一层一层往下游传。
+> 订阅信号从下游往上游走，建立 Subscriber 链。数据信号从上游往下游走，沿 Subscriber 链流动。
 >
-> 数据流回 ServerChannel，靠的是"记"，不是"找"。WebFlux 在装配阶段就把 `ServerWebExchange` 记进了末端 Subscriber 的闭包里。数据到达末端，末端自然知道该往哪里写。
+> subscribe() 本身不阻塞。但如果数据源是同步的，它会在当前线程执行到 `onComplete` 才返回；如果是异步的，它注册回调后立即返回。
+>
+> 异步的本质不是"多线程"，而是"当前线程不亲自等，把等待和后续处理交给一个回调"。
+>
+> 数据流回 ServerChannel，靠的是"记"，不是"找"。WebFlux 在装配阶段就把 `ServerWebExchange` 记进了末端 Subscriber 的闭包里。
 >
 > 真正发送数据时，`writeAndFlush` 会保证落到正确的 EventLoop 上。
 
@@ -889,31 +1259,40 @@ Spring WebFlux 并没有脱离 Netty 的线程模型。它只是通过三层结�
 5. **`WebFilter` 更像 Servlet Filter，而不是 HandlerInterceptor。**
    它执行在 `DispatcherHandler` 之前，拿不到 HandlerMethod。WebFlux 里没有 Interceptor 的严格等价物。
 
-6. **Mono 和 Flux 是 Publisher。**
-   Publisher 是"数据源"，Subscriber 是"数据接收者"，`subscribe` 把两者连接起来。Publisher 通过 `onNext` / `onError` / `onComplete` 向 Subscriber 推送信号。
+6. **响应式流有五个角色：Publisher、Subscriber、Subscription、request、onNext。**
+   `subscribe` 和 `request` 从下游往上游走；`onSubscribe`、`onNext`、`onComplete`、`onError` 从上游往下游走。
 
-7. **链式调用构建的是一串 Publisher。**
-   每个操作符产生一个新的 Publisher，包装前一个。订阅时，订阅信号沿 Publisher 链向上传播，逐层建立 Subscriber 配对。
+7. **一个操作符，一对新的 Publisher/Subscriber。**
+   装配阶段构造 Publisher 链（从上往下持有），订阅阶段构造 Subscriber 链（从下往上配对）。两条链方向相反，一一对应。
 
 8. **链式调用不是"顺序执行"，而是"构建蓝图"。**
    `webClient.get().uri(...).retrieve().bodyToMono(...)` 在 Controller 返回时，一行都没执行。它只构建了一条 Publisher 链。
 
-9. **subscribe() 是分界线。**
-   它启动装配：订阅信号向上传播，最上游 Publisher 拿 ClientChannel、写入请求、注册 ResponseHandler。装配过程跑在 Server EventLoop 上。
+9. **subscribe() 本身不阻塞。**
+   如果数据源是同步的，它会在当前线程执行到 `onComplete` 才返回。如果是异步的，它注册回调后立即返回。真正的显式阻塞是 `block()`。
 
-10. **装配完成后，没有线程被阻塞。**
-    Server EventLoop 回到循环，继续处理其他 Channel。
+10. **同步源和异步源的 `request` 行为不同。**
+    同步源的 `request` 是"当场发货"；异步源的 `request` 是"登记需求 + 注册回调"。
 
-11. **响应到达时，Client EventLoop 唤醒。**
+11. **同步与异步的分水岭在 IO 层，不在 API 层。**
+    RestTemplate 底层是 BIO，当前线程必须亲自 `read()`，`read()` 会阻塞线程。WebClient 底层是 NIO，注册 Handler 后立即返回，响应由 EventLoop 在将来通过 `select()` 感知并读取。
+
+12. **不是 Mono 让 WebClient 异步的。**
+    如果底层是 BIO，返回 Mono 也还是同步阻塞。真正让 WebClient 异步的，是它底层用的 NIO。
+
+13. **响应到达时，Client EventLoop 唤醒。**
     `ResponseHandler` 调用最上游 Subscriber 的 `onNext`，数据沿 Subscriber 链向下游流动，`.bodyToMono` 等操作符在这时执行。
 
-12. **写回响应，靠的是"记"，不是"找"。**
+14. **写回响应，靠的是"记"，不是"找"。**
     WebFlux 在装配阶段就把 `ServerWebExchange`（内含 `ServerChannel` 引用）记进了末端 Subscriber 的闭包。数据到达末端，末端用它写回响应。
 
-13. **`writeAndFlush` 负责把数据交给正确的 EventLoop。**
+15. **`writeAndFlush` 负责把数据交给正确的 EventLoop。**
     它内部检查当前线程，不是目标 EventLoop 就把任务排进队列。底层是 `eventLoop().execute(task)`。
 
-14. **Reactor Netty 默认共享全局资源，并支持共址机制。**
+16. **在 WebFlux 里，不要手动 subscribe。**
+    业务代码只负责"构建 Publisher 链"，由框架在合适的时机订阅。需要副作用用 `doOnXxx`，需要组合用 `flatMap` / `then` / `zip`。
+
+17. **Reactor Netty 默认共享全局资源，并支持共址机制。**
     这能让客户端连接尽量复用当前 EventLoop，减少线程切换。但具体是否同线程，取决于配置和场景。
 
 下次写下：
@@ -929,9 +1308,10 @@ webClient.get()
 
 - 这段链式调用本身什么都没做，只是在构建一条 Publisher 链；
 - 订阅让它活过来，Publisher 链和 Subscriber 链一一配对；
-- 装配完成后，线程回到循环，等待响应；
-- 响应到达时，Client EventLoop 唤醒，数据沿 Subscriber 链向下游流动；
+- 最上游 Publisher 底层用 NIO 发出请求，注册 Handler，立即返回；
+- subscribe() 在异步边界处返回，EventLoop 回到循环，等待响应；
+- 响应到达时，Client EventLoop 通过 `select()` 感知，触发 ResponseHandler，数据沿 Subscriber 链向下游流动；
 - 数据到达末端时，末端 Subscriber 用闭包里早就记下的 `ServerWebExchange` 写回 ServerChannel；
 - 最后 `writeAndFlush` 保证数据落到正确的 EventLoop 上。
 
-没有魔法。只有 EventLoop 的循环、Publisher/Subscriber 的配对、闭包的捕获、`writeAndFlush` 的线程调度，以及装配（Assembly）和执行（Execution）两个阶段的分野。
+没有魔法。只有 EventLoop 的循环、NIO 的 `select()`、Publisher/Subscriber 的配对、闭包的捕获、`writeAndFlush` 的线程调度，以及装配（Assembly）和执行（Execution）两个阶段的分野。
