@@ -182,9 +182,79 @@ public class FilteringWebHandler implements WebHandler {
 }
 ```
 
-它的职责是：**把当前路由的 `GatewayFilter` 和所有 `GlobalFilter` 合并、排序，组装成一条链，然后执行。** 每个过滤器都可以在转发请求**之前**做处理，也可以调用 `chain.filter(exchange)` 之后，在**之后**做处理。这就是 Gateway 过滤器“pre”和“post”逻辑的来源。
+它的职责是：**把当前路由的 `GatewayFilter` 和所有 `GlobalFilter` 合并、排序，组装成一条链，然后执行。**
 
-### 3.3 调用关系：两个 WebHandler，一外一内
+### 3.3 过滤器链里到底在发生什么：一次真实的转发
+
+到这里，`FilteringWebHandler` 的职责已经说清楚了——它负责组装并启动过滤器链。但“过滤器链”这四个字仍然很抽象。它到底长什么样？执行起来是什么感觉？
+
+看一个最简单的自定义过滤器：
+
+```java
+public class AddHeaderFilter implements GatewayFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        // 在转发之前，给下游请求加一个 header
+        exchange.getRequest().mutate()
+                .header("X-Gateway-Trace", "gateway-01")
+                .build();
+
+        return chain.filter(exchange);
+    }
+}
+```
+
+这个过滤器做的事情只有一件：在请求被转发到下游之前，往它的 header 里塞一个 `X-Gateway-Trace`。然后调用 `chain.filter(exchange)`，把控制权交给链中的下一个过滤器。
+
+再看一个更完整的、带“前后逻辑”的过滤器：
+
+```java
+public class TimingFilter implements GatewayFilter {
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        long start = System.currentTimeMillis();
+
+        return chain.filter(exchange)
+                .then(Mono.fromRunnable(() -> {
+                    long cost = System.currentTimeMillis() - start;
+                    log.info("request to {} cost {} ms",
+                            exchange.getRequest().getURI(), cost);
+                }));
+    }
+}
+```
+
+`chain.filter(exchange)` 之前是 pre 逻辑，之后（通过 `.then()` 串联）是 post 逻辑。
+
+那么，真正把请求转发到下游的那个过滤器是谁？
+
+是 `NettyRoutingFilter`。它也是链中的一员，但它不是简单的“加个 header”或“记个耗时”，它做的事情是**真正发起对下游服务的 HTTP 请求**。它内部使用 Reactor Netty 的 `HttpClient`，把当前 `ServerWebExchange` 里的请求信息转成一个下游请求，发出去，拿到响应，再写回 `ServerWebExchange` 的响应里。
+
+把这三个过滤器按顺序串起来，一次完整转发大概是这样：
+
+```
+请求进入 Gateway
+  ↓
+AddHeaderFilter          → 给下游请求加 header
+  ↓  chain.filter(exchange)
+TimingFilter             → 记录开始时间
+  ↓  chain.filter(exchange)
+NettyRoutingFilter       → 真正转发到下游
+  ↓  拿到下游响应
+TimingFilter             → 计算耗时，打日志（post 逻辑）
+  ↓
+AddHeaderFilter          → （如果有 post 逻辑）
+  ↓
+响应返回给客户端
+```
+
+每一个过滤器都拿到同一个 `ServerWebExchange`，都可以读写它，都可以在 `chain.filter(exchange)` 前后插入自己的逻辑。**这就是 Gateway 过滤器链的本质：一条由 `FilteringWebHandler` 组装、由 `ServerWebExchange` 贯穿的响应式处理链。**
+
+而这条链的位置，是在 `DispatcherHandler` 内部，在路由匹配完成之后。它和第二章讲的 `WebFilter` 链，是两条完全不同层面上的链。
+
+### 3.4 调用关系：两个 WebHandler，一外一内
 
 把调用链路画出来：
 
@@ -204,7 +274,7 @@ NettyRoutingFilter → 下游
 
 **`DispatcherHandler` 是调度者，它在外面；Gateway 的 `FilteringWebHandler` 是被调用的 Handler，它在里面。**
 
-### 3.4 完整链路：两个 FilteringWebHandler 各就各位
+### 3.5 完整链路：两个 FilteringWebHandler 各就各位
 
 现在把两个 `FilteringWebHandler` 在完整链路中的位置标出来：
 
