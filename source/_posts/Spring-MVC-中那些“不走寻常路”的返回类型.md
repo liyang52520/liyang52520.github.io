@@ -7,8 +7,6 @@ categories:
   - develop
 ---
 
-# Spring MVC 中那些“不走寻常路”的返回类型：完整指南
-
 ## 一、从“普通返回”说起
 
 在 Spring MVC 中，最熟悉的控制器返回值是这样的：

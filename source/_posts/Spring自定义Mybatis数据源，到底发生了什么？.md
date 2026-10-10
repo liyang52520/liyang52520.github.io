@@ -52,8 +52,7 @@ public class PostgreSQLConfig {
 
 它到底是怎么样生效的呢？发生了什么？结合这篇能对之前的文章有更好的了解。
 
-# 一、先看这个配置类做了什么
-# 以 `PostgreSQLConfig` 为例：完整走一遍 MyBatis-Plus 的启动与运行流程
+## 以 `PostgreSQLConfig` 为例：完整走一遍 MyBatis-Plus 的启动与运行流程
 
 这个配置类非常典型，它把我们前面讨论的所有概念都串起来了。下面以它为线索，从 Spring 启动到运行时，完整走一遍。
 
