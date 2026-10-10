@@ -90,11 +90,7 @@ public void download(HttpServletResponse response) throws IOException {
 
 **适用场景**：仅限小文件，如配置文件、图标、验证码图片。
 
-### 3.3 ResponseEntity<Resource>：三种 Resource 的分野
-
-`Resource` 是一个接口，不同实现类的行为差异很大。
-
-**FileSystemResource** 包装文件系统路径。`ResourceHttpMessageConverter` 通过 `StreamUtils.copy()` 将文件内容从磁盘复制到响应输出流。很多资料声称它支持"零拷贝"，实际情况是：Spring Framework 的 `ResourceHttpMessageConverter` 目前仍然使用流复制，真正的 `sendfile` 零拷贝发生在 Tomcat 的 `DefaultServlet` 处理静态资源时。不过，`FileSystemResource` 在内存效率上确实优秀，同时 `ResourceHttpMessageConverter` 原生支持 HTTP Range 请求（断点续传）。
+### 3.3 ResponseEntity<Resource>：把"取用凭证"交给 Spring
 
 ```java
 @GetMapping("/download")
@@ -106,9 +102,33 @@ public ResponseEntity<Resource> download() {
 }
 ```
 
-**InputStreamResource** 包装已有的 `InputStream`，适合从数据库 BLOB、远程服务等非文件系统源获取数据。陷阱：流的关闭时机。如果在 Controller 方法中用 try-with-resources 包装 InputStream，方法返回前流就被关闭了，Spring 写响应时会抛出 `Stream Closed` 异常。此外，`InputStream` 只能被读取一次，无法实现断点续传。
+这段代码没有读文件、没有写流、没有关流，但文件确实传下去了。原因是：**`Resource` 里不装数据，它只是一张"字节流的取用凭证"**——一个 `getInputStream()`，加一组元信息（长度、文件名）。`FileSystemResource.getInputStream()` 就是 `Files.newInputStream(path)`，在有人调用它之前，一个字节都没从磁盘读出来。所以 Controller "瞬间返回"是理所当然的。
 
-**ByteArrayResource** 与 `ResponseEntity<byte[]>` 本质相同，内存问题也相同。
+真正的读写链条是：
+
+```
+ResponseEntity<Resource>
+  → HttpEntityMethodProcessor        // 返回值处理器：落地状态码/响应头，挑转换器
+    → ResourceHttpMessageConverter   // 消息转换器：把字节写出去
+      → resource.getInputStream() → 响应 OutputStream   // 8KB 循环拷贝
+```
+
+这条链路由 Spring MVC 的两张默认表铺好（返回值处理器表、消息转换器表），不需要任何配置。两张表的顺序、内容协商、`Resource` 转换器的完整实现见[Spring MVC 中那些"不走寻常路"的返回类型](https://liyang52520.github.io/2026/09/14/Spring-MVC-%E4%B8%AD%E9%82%A3%E4%BA%9B%E2%80%9C%E4%B8%8D%E8%B5%B0%E5%AF%BB%E5%B8%B8%E8%B7%AF%E2%80%9D%E7%9A%84%E8%BF%94%E5%9B%9E%E7%B1%BB%E5%9E%8B/)的 6.2 与 8.1~8.2 节。
+
+这条路径有两个"免费"特性，都来自转换器在写 body 之前补的响应头：
+
+- **`Content-Length`**：来自 `resource.contentLength()`（`FileSystemResource` 就是 `Files.size()`）。所以浏览器有进度条，响应也不是 chunked——这点正好和 3.4 的 `StreamingResponseBody` 相反；
+- **`Content-Type`**：默认按文件名的**扩展名**推断（`file.zip` → `application/zip`）。文件名里的扩展名不能丢；想固定下来就显式 `.contentType(...)`。
+
+**Range（断点续传）在这条路径上是开箱即用的**：客户端带 `Range` 头时，`HttpEntityMethodProcessor` 会把状态码改成 206，把 `Resource` 翻译成 `List<ResourceRegion>`，交给 `ResourceRegionHttpMessageConverter` 分段写出。它的前提是"能重新打开、且知道总长度"，这解释了为什么 `InputStreamResource` 不在其列——它只能读一次、长度未知：
+
+| Resource | 可重复读 | 长度 | Range | 典型用途 |
+|:---|:---|:---|:---|:---|
+| `FileSystemResource` / `ClassPathResource` / `UrlResource` | 可以 | 精确 | 支持 | 本地磁盘、jar 内资源 |
+| `ByteArrayResource` | 可以 | 精确 | 支持 | 数据库 BLOB、动态生成的二进制 |
+| `InputStreamResource` | **不可以** | **未知** | **不支持** | 只能取一次的网络流、管道流 |
+
+**线程占用**：Tomcat 线程全程占用——上面那条链（包括 8KB 拷贝循环）是在"处理返回值"的那个工作线程上同步跑完的。**核心矛盾**：内存效率优秀、Range 开箱即用，但线程占用和数据拷贝两个瓶颈一个都没解决；第四章会说明为什么这里的 `FileChannel` 也救不了零拷贝。
 
 ### 3.4 StreamingResponseBody：把阻塞转移出去
 
@@ -146,6 +166,8 @@ Poller 线程不参与这个写入过程。它依然只负责监听事件和派�
 
 所以 `StreamingResponseBody` 的本质是：**把阻塞从 Tomcat 工作线程转移到了异步线程池中的线程。** Tomcat 线程池的容量不再被慢速下载占用，但你必须为异步线程池配置足够的线程，否则它同样会成为瓶颈。如果不显式配置 `AsyncTaskExecutor`，Spring 默认使用 `SimpleAsyncTaskExecutor`，它每次调用都新建线程，高并发下线程数会失控。正确做法是通过 `WebMvcConfigurer.configureAsyncSupport()` 配置一个 `ThreadPoolTaskExecutor`。
 
+**还有一个容易踩的坑：异步超时。** 异步请求有自己的超时时间，通过 `spring.mvc.async.request-timeout`（对应 `AsyncSupportConfigurer#setDefaultTimeout`）配置；不配置就用容器默认值，Tomcat connector 的 `asyncTimeout` 默认 30 秒。大文件下载很容易超过这个时间，如果不显式调大，传输中途会被判超时，客户端看到的就是一个被截断的响应——这是"`StreamingResponseBody` 莫名中断"最常见的原因。
+
 **适用场景**：动态生成的大文件下载，以及需要低内存占用的高并发下载场景。
 
 ### 3.5 DeferredResult 与 WebAsyncTask：异步的"等待"
@@ -156,7 +178,7 @@ Poller 线程不参与这个写入过程。它依然只负责监听事件和派�
 @GetMapping("/report")
 public DeferredResult<ResponseEntity<Resource>> downloadReport() {
     DeferredResult<ResponseEntity<Resource>> result = new DeferredResult<>(60_000L);
-    
+
     CompletableFuture.runAsync(() -> {
         File file = reportService.generateReport();
         FileSystemResource resource = new FileSystemResource(file);
@@ -164,12 +186,39 @@ public DeferredResult<ResponseEntity<Resource>> downloadReport() {
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=report.xlsx")
                 .body(resource));
     });
-    
+
     return result;
 }
 ```
 
-**线程占用**：等待阶段释放 Tomcat 线程，写回阶段仍占用 Tomcat 线程。**核心矛盾**：只解决了"等待阶段"的线程占用。一旦结果被设置并触发 `dispatch()`，写回响应仍发生在 Tomcat 线程上。
+**线程占用**：等待阶段是**零线程**——`DeferredResult` 不向任何线程池提交任务，`setResult` 由哪个线程调用，就由哪个线程顺手触发一次 `dispatch()`。但**写回阶段仍然占用 Tomcat 线程**：容器线程重新接管请求后，`ResourceHttpMessageConverter` 就在这个线程上同步拷贝数据。
+
+那能不能连写回也不占 Tomcat 线程？可以。`DeferredResult` 和 `StreamingResponseBody` 不是二选一，而是正交的两件事：前者决定"结果什么时候产生"，后者决定"body 谁来写"。叠起来就是编程层线程占用最省的组合：
+
+```java
+@GetMapping("/report")
+public DeferredResult<ResponseEntity<StreamingResponseBody>> downloadReport() {
+    DeferredResult<ResponseEntity<StreamingResponseBody>> result = new DeferredResult<>(60_000L);
+
+    CompletableFuture.runAsync(() -> {
+        Path file = reportService.generateReport();          // 慢准备：不占任何线程池
+        result.setResult(ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=report.xlsx")
+                .body(out -> Files.copy(file, out)));        // 写流：异步线程池
+    });
+
+    return result;
+}
+```
+
+嵌套为什么成立：`dispatch()` 之后请求处于 `DISPATCHED` 状态（此时 `request.isAsyncStarted()` 返回 `false`），Tomcat 允许在此基础上再开一个新的异步周期，于是形成"等结果 → 派发 → 交给异步池写流 → 再派发收尾"两段异步。机制细节见[《不走寻常路》8.3 节](https://liyang52520.github.io/2026/09/14/Spring-MVC-%E4%B8%AD%E9%82%A3%E4%BA%9B%E2%80%9C%E4%B8%8D%E8%B5%B0%E5%AF%BB%E5%B8%B8%E8%B7%AF%E2%80%9D%E7%9A%84%E8%BF%94%E5%9B%9E%E7%B1%BB%E5%9E%8B/)。
+
+**两个必须注意的点**：
+
+1. **超时分两段**：`DeferredResult` 的 timeout 只覆盖等待阶段；流式阶段是一个新的异步周期，超时取 `spring.mvc.async.request-timeout`，不配置就是容器默认值（Tomcat 的 `asyncTimeout`，默认 30 秒，见 3.4 节）。
+2. **每次派发都会重跑一遍 `HandlerInterceptor#preHandle`**（此时 `request.getDispatcherType()` 为 `ASYNC`），鉴权、会话计数、限流这类逻辑要保证幂等；嵌套方案比单层方案还多一次派发。
+
+**核心矛盾**：状态码和响应头必须在"准备成功"之后才能确定——这恰恰是它的价值。准备失败时可以用 `setErrorResult` 正常返回 4xx/5xx，而如果把准备逻辑写进 `StreamingResponseBody` 的 lambda 里，状态码在进入 lambda 之前就已经是 200 了。
 
 ### 3.6 编程层小结
 
@@ -180,7 +229,8 @@ public DeferredResult<ResponseEntity<Resource>> downloadReport() {
 | `ResponseEntity<FileSystemResource>` | 全程占用 | 低 | 原生支持 | 无 |
 | `ResponseEntity<InputStreamResource>` | 全程占用 | 低 | 不支持 | 无 |
 | `StreamingResponseBody` | 仅请求接收阶段 | 低 | 需手动 | 必需配置 |
-| `DeferredResult` | 等待阶段释放，写回阶段占用 | 取决于包装类型 | 取决于包装类型 | 视实现而定 |
+| `DeferredResult<ResponseEntity<Resource>>` | 等待阶段零线程，写回阶段占用 | 取决于包装类型 | 取决于包装类型 | 无 |
+| `DeferredResult<ResponseEntity<StreamingResponseBody>>` | 仅两次派发瞬间占用 | 低 | 需手动 | 必需配置 |
 
 编程层解决的是"谁写、怎么写"。`StreamingResponseBody` 已经能把 Tomcat 工作线程从数据传输阶段解放出来，但它没有解决第二个瓶颈：数据仍然要经过用户态，被反复拷贝。
 
@@ -540,17 +590,18 @@ public void download(HttpServletResponse response) {
 
 **第二层判断：是否需要断点续传。** 如果需要，`ResponseEntity<FileSystemResource>` 是唯一开箱即用的选择。
 
-**第三层判断：并发量。** 并发不高，`FileSystemResource` 可接受。并发数百以上，`StreamingResponseBody` 释放 Tomcat 工作线程，但必须配置异步线程池。
+**第三层判断：并发量。** 并发不高，`FileSystemResource` 可接受。并发数百以上，`StreamingResponseBody` 释放 Tomcat 工作线程，但必须配置异步线程池；如果准备阶段也慢，就把它包成 `DeferredResult<ResponseEntity<StreamingResponseBody>>`（3.5 节），等待阶段连异步线程都不用占。
 
-**第四层判断：是否达到架构瓶颈。** "准备耗时 + 并发大 + 文件大"三者叠加时，不要试图在 Spring MVC 里用 `transferTo` 硬扛。文件在本地且已有 Nginx → 模式 B；文件动态生成且愿意上云 → 模式 A；系统大且需要独立扩容 → 模式 C。
+**第四层判断：是否达到架构瓶颈。** "准备耗时 + 并发大 + 文件大"三者叠加、编程层方案扛不住时，不要试图在 Spring MVC 里用 `transferTo` 硬扛。文件在本地且已有 Nginx → 模式 B；文件动态生成且愿意上云 → 模式 A；系统大且需要独立扩容 → 模式 C。
 
 | 场景 | 推荐方案 | 核心理由 |
 |:---|:---|:---|
 | 小型文件下载 | `ResponseEntity<byte[]>` | 实现最快 |
-| 大型本地文件，需断点续传 | `ResponseEntity<FileSystemResource>` | 内存友好，原生 Range |
+| 大型本地文件，需断点续传 | `ResponseEntity<FileSystemResource>` | 内存友好，Range 开箱即用 |
 | 大型动态文件，高并发 | `StreamingResponseBody` + 异步线程池 | 释放 Tomcat 工作线程 |
 | 从数据库/网络流下载 | `ResponseEntity<InputStreamResource>` | 适合非文件系统源 |
 | 文件准备过程耗时 | `DeferredResult<ResponseEntity<Resource>>` | 异步等待文件就绪 |
+| 准备慢 + 文件大 | `DeferredResult<ResponseEntity<StreamingResponseBody>>` | 零线程等待 + 异步线程写流 |
 | 文件在本地，已有 Nginx | **模式 B**：Nginx X-Accel-Redirect | 零拷贝真实生效，线程释放 |
 | 文件动态生成，并发高 | **模式 A**：对象存储 + 预签名 URL | 带宽由对象存储承担 |
 | 大型系统，需独立扩容 | **模式 C**：独立文件服务 | 控制面与数据面解耦 |
@@ -564,6 +615,6 @@ Spring 文件下载的复杂性，源于它同时面对两个独立的瓶颈：�
 
 1. **不要用 `byte[]` 传大文件**，会 OOM。
 2. **不要自己写 `FileChannel.transferTo`**，在 Spring MVC 里大概率不生效。要零拷贝就用 Tomcat 的 sendfile 请求属性、Nginx 的 `X-Accel-Redirect`，或者用 Netty 的 `FileRegion`。
-3. **用 `StreamingResponseBody` 一定要配置异步线程池**，否则默认的 `SimpleAsyncTaskExecutor` 会每次新建线程。
+3. **用 `StreamingResponseBody` 一定要配置异步线程池**，否则默认的 `SimpleAsyncTaskExecutor` 会每次新建线程；同时把 `spring.mvc.async.request-timeout` 调大，否则大文件可能传到一半被判超时。
 
 真正重要的不是记住"哪个方案最好"，而是建立一套清晰的分析框架：先判断文件大小和并发量级，再判断是否需要断点续传，最后判断文件准备过程的耗时特征。当两个瓶颈都成为问题时，最优雅的架构往往不是"在 Spring 里硬扛"，而是将文件存储交给对象存储或 CDN，Spring 只负责签发临时访问凭证。

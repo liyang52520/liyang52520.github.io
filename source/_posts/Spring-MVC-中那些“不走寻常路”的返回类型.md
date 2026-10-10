@@ -74,6 +74,8 @@ public DeferredResult<String> deferred() {
 
 **一句话总结**：`DeferredResult` 是“一次性结果交付”，它的写入发生在**重新派发后的新工作线程**中，写入一次完整结果。
 
+**一个容易被忽略的扩展**：上面说的“重新派发后由工作线程写入”，前提是 `DeferredResult<T>` 里的 `T` 是普通对象（`String`、`ResponseEntity<Resource>` 之类），它的写出是同步的。如果让 `T` 本身也是流式类型，写成 `DeferredResult<ResponseEntity<StreamingResponseBody>>`，写流就交给了异步线程池，容器线程只在两次派发时短暂停留（机制见 8.3，使用场景见[《Spring 文件下载全方案深度解析》3.5 节](https://liyang52520.github.io/2026/09/15/Spring-%E6%96%87%E4%BB%B6%E4%B8%8B%E8%BD%BD%E5%85%A8%E6%96%B9%E6%A1%88%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90/)）。
+
 ### 2.3 Callable 和 WebAsyncTask
 
 ```java
@@ -320,7 +322,7 @@ public Map<String, Object> home() {
 
 ## 六、资源与原始数据类型
 
-### 6.1 Resource
+### 6.1 Resource：不装数据的“字节流取用凭证”
 
 ```java
 @GetMapping("/image")
@@ -333,15 +335,102 @@ public ResponseEntity<Resource> image() throws IOException {
 }
 ```
 
-常见实现：`ByteArrayResource`、`InputStreamResource`、`FileSystemResource`、`ClassPathResource`、`UrlResource`。
+`Resource` 是 Spring 对“可读取的字节来源”的统一抽象，父接口只有一个方法：
 
-### 6.2 底层原理
+```java
+@FunctionalInterface
+public interface InputStreamSource {
+    /** 约定：每次调用通常都应该返回一个新的流 */
+    InputStream getInputStream() throws IOException;
+}
+```
 
-`Resource` 由 `ResourceHttpMessageConverter` 处理。它的逻辑是：**从 `Resource` 的 `InputStream` 读字节，写到响应的 `OutputStream`**，每次读写 4096 字节。
+**关键点：Resource 里不装数据。** 它装的是一个打开字节流的入口（`getInputStream()`），加一组元信息（`contentLength()`、`getFilename()`、是否可随机访问）。`FileSystemResource` 的实现就是 `Files.newInputStream(path)` 和 `Files.size(path)`——在有人调用它之前，一个字节都没从磁盘读出来。这也解释了为什么 Controller 返回 `Resource` 是“瞬间”的。
 
-它还支持 **HTTP Range 请求**（断点续传）——客户端说“我要第 1000 到 2000 字节”，它就只发这一段。
+| Resource | 可重复读 | contentLength() | Range | 典型用途 |
+| :--- | :--- | :--- | :--- | :--- |
+| `FileSystemResource` / `ClassPathResource` / `UrlResource` | 可以 | 精确 | 支持 | 本地磁盘、jar 内资源 |
+| `ByteArrayResource` | 可以 | `byteArray.length` | 支持 | 数据库 BLOB、动态生成 |
+| `InputStreamResource` | **不可以** | **未知** | **不支持** | 只能取一次的网络流 |
 
-它本质上仍然是一个 `HttpMessageConverter`，只是在“普通序列化”和“原始字节流”之间找到了一个专用通道。
+`InputStreamResource` 的三个坑都能被 6.2 的机制解释：转换器会在写完 body 后自己关流，所以**不能用 try-with-resources 包它**（否则写出时就是 `Stream Closed`）；它给不出长度，响应退化成 chunked；它被排除在 Range 之外，也不能重试。而 `ByteArrayResource` 最省事也最危险——数据全部驻留堆内存，传大文件一样会 OOM。
+
+### 6.2 底层原理：从返回值到响应体，Resource 走了哪条路
+
+`Resource` 不是什么“特殊返回类型”，它走的是所有返回类型共用的两张表（第八章）：
+
+```
+ResponseEntity<Resource>
+  → HttpEntityMethodProcessor      // 返回值处理器：落地状态码/响应头，挑转换器
+    → ResourceHttpMessageConverter // 消息转换器：把字节写出去
+      → resource.getInputStream() → response.getOutputStream()   // 8KB 循环拷贝
+```
+
+`ResourceHttpMessageConverter` 之所以“闭着眼睛都能匹配”，是因为它的条件极宽松：
+
+```java
+@Override
+protected boolean supports(Class<?> clazz) {
+    return Resource.class.isAssignableFrom(clazz);   // 只要是 Resource 子类就认
+}
+// 构造器里 super(MediaType.ALL)：支持的媒体类型是 */*，任何 Accept 都兼容
+```
+
+真正写出前，它还会补两个响应头（`AbstractHttpMessageConverter.addDefaultHeaders`）：
+
+```java
+@Override
+protected MediaType getDefaultContentType(Resource resource) {
+    // 按文件名后缀猜 MIME：file.zip → application/zip
+    return MediaTypeFactory.getMediaType(resource).orElse(MediaType.APPLICATION_OCTET_STREAM);
+}
+
+@Override
+protected Long getContentLength(Resource resource, @Nullable MediaType contentType) throws IOException {
+    if (InputStreamResource.class == resource.getClass()) {
+        return null;                       // 问长度就得把流读完，后面就没法写了
+    }
+    long contentLength = resource.contentLength();
+    return (contentLength < 0 ? null : contentLength);
+}
+```
+
+所以下载接口天然带进度条（`Content-Length` 在写 body 之前就定好了，响应不是 chunked），`Content-Type` 也常常自动正确（按扩展名推断，**文件名里的扩展名不能丢**）。不过客户端可以用 `Accept` 覆盖它：协商结果是 `application/pdf` 时，octet-stream 那个分支不成立，Content-Type 就变成了 `application/pdf`——想固定就显式 `.contentType(...)`。
+
+还有一件事值得澄清：**“能下载”不是 Resource 的功劳，而是 `Content-Disposition` 决定的**，Resource 只决定“数据从哪来”。另外 `AbstractMessageConverterMethodProcessor.addContentDispositionHeader()` 在响应头为空且状态码为 2xx 时，会检查请求 URI 后缀是否“安全”，不安全才补一个 `inline;filename=f.txt`——那是防反射型文件下载（RFD）的安全措施，和“帮你下载”无关。
+
+### 6.3 底层原理：断点续传和转换器无关
+
+“`ResourceHttpMessageConverter` 原生支持 HTTP Range”是个流传很广的错误说法。Range 的判断和翻译在 `writeWithMessageConverters()` 的开头（`AbstractMessageConverterMethodProcessor`，5.3 和 6.x 都在这里）：
+
+```java
+if (isResourceType(value, returnType)) {
+    outputMessage.getHeaders().set(HttpHeaders.ACCEPT_RANGES, "bytes");
+    if (value != null && inputMessage.getHeaders().getFirst(HttpHeaders.RANGE) != null &&
+            outputMessage.getServletResponse().getStatus() == 200) {
+        Resource resource = (Resource) value;
+        try {
+            List<HttpRange> httpRanges = inputMessage.getHeaders().getRange();
+            outputMessage.getServletResponse().setStatus(HttpStatus.PARTIAL_CONTENT.value());   // 206
+            body = HttpRange.toResourceRegions(httpRanges, resource);    // Resource → List<ResourceRegion>
+            targetType = RESOURCE_REGION_LIST_TYPE;                      // 转换器也跟着换了
+        }
+        catch (IllegalArgumentException ex) {
+            outputMessage.getServletResponse().setStatus(HttpStatus.REQUESTED_RANGE_NOT_SATISFIABLE.value()); // 416
+        }
+    }
+}
+
+// 支持 Range 的前提是“能重新打开、且知道总长度”
+protected boolean isResourceType(@Nullable Object value, MethodParameter returnType) {
+    Class<?> clazz = getReturnValueType(value, returnType);
+    return clazz != InputStreamResource.class && Resource.class.isAssignableFrom(clazz);
+}
+```
+
+真正分段写出的是 `ResourceRegionHttpMessageConverter`：它写 `Content-Range: bytes start-end/total`，把 `Content-Length` 设成这一段长度，然后 `StreamUtils.copyRange(in, out, start, end)`——**依然全程用户态拷贝**，和零拷贝无关。多个区间会写成 `multipart/byteranges`。
+
+`isResourceType()` 里那个 `!= InputStreamResource.class` 就是“`InputStreamResource` 不支持断点续传”的根因：只能读一次、长度未知，做不了区间。另外这段逻辑写在父类里，所以裸 `Resource`（`@ResponseBody` 那条路）同样支持 Range，不只是 `ResponseEntity<Resource>`。
 
 
 ## 七、响应式类型：在 MVC 中的“伪装”
@@ -369,17 +458,75 @@ public Flux<String> flux() {
 **如果你需要真正的非阻塞响应式，用 Spring WebFlux，别在 MVC 里硬凑。**
 
 
-## 八、统一原理：三个核心机制
+## 八、统一原理：两张表 + 两套机制
 
-所有这些返回类型能工作，靠的是三个机制：
+所有这些返回类型能工作，靠的是四个机制：两张表决定“谁处理、怎么写”，`AsyncContext` 和 Chunked 决定“什么时候写、怎么写多次”。
 
-### 8.1 分拣中心：HandlerMethodReturnValueHandler 策略链
+### 8.1 第一张表：HandlerMethodReturnValueHandler 策略链
 
 Spring MVC 处理返回值靠的是 `HandlerMethodReturnValueHandler` 策略接口。Spring MVC 启动时会注册一个**有序列表**，每种返回类型都有对应的处理器实现。`HandlerMethodReturnValueHandlerComposite` 会遍历这个列表，找到第一个 `supportsReturnType` 返回 `true` 的处理器，把处理权交给它。这是**责任链设计模式**。
 
-**顺序至关重要**。比如 `HttpEntityMethodProcessor` 被明确配置在 `@ResponseBody` 的处理器之前，否则 `ResponseEntity` 就会被后者抢先处理。
+这张表在 `RequestMappingHandlerAdapter.getDefaultReturnValueHandlers()` 里硬编码、带顺序（节选）：
 
-### 8.2 电话转接：Servlet 3.0 AsyncContext
+| 顺序 | 处理器 | 认领的返回类型 |
+| :--- | :--- | :--- |
+| 1 | `ModelAndViewMethodReturnValueHandler` | `ModelAndView` |
+| 4 | `ResponseBodyEmitterReturnValueHandler` | `ResponseBodyEmitter` / `SseEmitter` |
+| 5 | `StreamingResponseBodyReturnValueHandler` | `StreamingResponseBody` |
+| 6 | `HttpEntityMethodProcessor` | `HttpEntity` / `ResponseEntity` |
+| 7 | `HttpHeadersReturnValueHandler` | `HttpHeaders` |
+| 8 | `CallableMethodReturnValueHandler` | `Callable` |
+| 9 | `DeferredResultMethodReturnValueHandler` | `DeferredResult` |
+| 12 | `RequestResponseBodyMethodProcessor` | `@ResponseBody` |
+| 13 | `ViewNameMethodReturnValueHandler` | `String`（视图名） |
+| 兜底 | `ServletModelAttributeMethodProcessor` | 其余类型（当模型属性处理） |
+
+**顺序至关重要**，它直接决定了“换个返回类型，行为就整体换轨”：第 5 位会把写动作扔给异步线程池，第 6 位会同步调用消息转换器，第 9 位只登记回调。也正因为 `HttpEntityMethodProcessor` 排在 `@ResponseBody` 的处理器之前，`ResponseEntity` 才不会被后者抢先处理。
+
+### 8.2 第二张表：HttpMessageConverter 与内容协商
+
+返回值处理器只是说“轮到我了”，真正把 body 变成字节的是消息转换器。`writeWithMessageConverters()` 的流水线是：
+
+```
+确定 body 类型 → 内容协商（Accept ↔ 能产出的媒体类型）→ 选一个 HttpMessageConverter → converter.write(...)
+```
+
+匹配时用的是两个类型，别混：
+
+```java
+Class<?> valueType = getReturnValueType(body, returnType);  // 运行时类，如 FileSystemResource
+Type targetType = getGenericType(returnType);               // 声明泛型，如 Resource（从 ResponseEntity<Resource> 解析）
+```
+
+转换器表同样是默认注册的（`WebMvcConfigurationSupport.addDefaultHttpMessageConverters()`），按顺序取第一个 `canWrite` 成功的：
+
+```java
+messageConverters.add(new ByteArrayHttpMessageConverter());
+messageConverters.add(new StringHttpMessageConverter());
+messageConverters.add(new ResourceHttpMessageConverter());        // Resource 命中它
+messageConverters.add(new ResourceRegionHttpMessageConverter());  // List<ResourceRegion>，Range 用
+...
+messageConverters.add(new MappingJackson2HttpMessageConverter()); // JSON 排在很后面
+```
+
+把两张表串起来，一次 `ResponseEntity<Resource>` 的完整链路是：
+
+```
+Controller 返回 ResponseEntity<FileSystemResource>
+  └─ 第一张表：HttpEntityMethodProcessor（第 6 位）
+      ├─ 落地状态码 / 响应头
+      ├─ Resource → Accept-Ranges: bytes；带 Range 头则改 206 + List<ResourceRegion>
+      └─ writeWithMessageConverters
+          ├─ 第二张表 + 内容协商 → selectedMediaType
+          └─ ResourceHttpMessageConverter.write
+              ├─ Content-Type   ← 文件名后缀（MediaTypeFactory）
+              ├─ Content-Length ← resource.contentLength()
+              └─ getInputStream() → ServletOutputStream（8KB 循环拷贝）
+```
+
+**两个容易踩的点**：`valueType` 是运行时类、`targetType` 是声明泛型，参与协商和转换器匹配的是**声明泛型**，所以 `ResponseEntity<Resource>` 里塞任何 Resource 子类都能稳定命中 Resource 转换器；`Content-Length` 只在转换器能给出长度时才写，给不出（比如 `InputStreamResource`）就退化成 chunked。
+
+### 8.3 电话转接：Servlet 3.0 AsyncContext
 
 异步和流式类型都调用 `request.startAsync()`，让 Tomcat 工作线程释放。
 
@@ -390,7 +537,9 @@ Spring MVC 处理返回值靠的是 `HandlerMethodReturnValueHandler` 策略接�
 
 在 Tomcat 内部，这一切由 `AsyncStateMachine` 状态机跟踪。每个请求对应的 `Http11Processor` 都持有一个状态机实例。当请求进入异步等待时，`Http11Processor` 被放入 `waitingProcessors` 集合，等待后续的 dispatch 或 complete 事件。
 
-### 8.3 分块快递：HTTP Chunked Encoding
+**一个反直觉的细节**：异步派发过程中可以再开一个新的异步周期。Tomcat 在 `AsyncContext.dispatch()` 之后把状态机置为 `DISPATCHED`（此时 `request.isAsyncStarted()` 返回 `false`），而 `AsyncStateMachine.asyncStart()` 正是只允许从 `DISPATCHED` 再次 `startAsync()`。这就是 `DeferredResult<ResponseEntity<StreamingResponseBody>>` 这类嵌套写法能成立的底层原因：等结果（第一段异步）→ 派发 → 写流（第二段异步，交给线程池）→ 再派发收尾。使用场景见[《Spring 文件下载全方案深度解析》3.5 节](https://liyang52520.github.io/2026/09/15/Spring-%E6%96%87%E4%BB%B6%E4%B8%8B%E8%BD%BD%E5%85%A8%E6%96%B9%E6%A1%88%E6%B7%B1%E5%BA%A6%E8%A7%A3%E6%9E%90/)。
+
+### 8.4 分块快递：HTTP Chunked Encoding
 
 普通响应必须先声明 `Content-Length`，然后一次性发送 body。分块编码则允许服务器在不知道整体内容长度的情况下开始传输响应，每个数据块都包含自身的大小。这就是 `ResponseBodyEmitter` 能多次 `send()` 的协议基础。
 
@@ -416,7 +565,7 @@ Spring MVC 处理返回值靠的是 `HandlerMethodReturnValueHandler` 策略接�
 | `String` / `ModelAndView` / `View` | 视图渲染 | 否 | 1 次（视图渲染） | ViewResolver | 页面渲染 |
 | `Map` / `Model` | 模型数据 | 否 | 1 次（视图渲染） | MapMethodProcessor | 页面渲染 |
 | `@ModelAttribute` | 模型属性 | 否 | 1 次（视图渲染） | 模型属性绑定 | 页面渲染 |
-| `Resource` | ResourceHttpMessageConverter | 是（专用） | 1 次 | 专用转换器（支持 Range） | 文件下载 |
+| `Resource` | ResourceHttpMessageConverter | 是（专用） | 1 次 | 专用转换器（Range 见 6.3） | 文件下载 |
 | `Mono<T>` / `Flux<T>` | 响应式包装 | 是 | 1 次或 N 次 | 适配为 DeferredResult/ResponseBodyEmitter | 响应式（MVC 中非真非阻塞） |
 
 **选择指南**：
@@ -446,7 +595,7 @@ Spring MVC 处理返回值靠的是 `HandlerMethodReturnValueHandler` 策略接�
 - **转换器维度**：`Resource` 及其子类
 - **模型维度**：`Mono`、`Flux`
 
-理解它们的关键，不是记住每个类的用法，而是理解它们各自解决的是什么维度的响应控制问题，以及背后的三个核心机制：**策略链**（分拣中心）、**AsyncContext**（电话转接）、**Chunked Encoding**（分块快递）。
+理解它们的关键，不是记住每个类的用法，而是理解它们各自解决的是什么维度的响应控制问题，以及背后的四个机制：**返回值处理器策略链**与**消息转换器**（两张表）、**AsyncContext**（电话转接）、**Chunked Encoding**（分块快递）。
 
 而在 Tomcat 内部，这一切由 `AsyncStateMachine` 状态机跟踪，由 `waitingProcessors` 集合管理等待中的异步请求，由 `Http11Processor` 承载每个请求的完整生命周期，最终通过 `ServletOutputStream` 完成字节的写出。区别只在于：**谁在什么线程上、以什么方式调用 `ServletOutputStream`**。
 
