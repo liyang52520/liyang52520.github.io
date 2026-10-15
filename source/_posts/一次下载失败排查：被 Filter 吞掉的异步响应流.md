@@ -395,7 +395,7 @@ if (returnValue == null) {
 
 **异步派发这一趟，不会再有任何一次写响应体的动作。**
 
-## 四、“加个 async 判断”为什么救不回来
+## 四、光加一个 async 判断，为什么不够
 
 很自然的想法是：Filter 里补一个派发类型判断，异步场景单独处理。
 
@@ -418,54 +418,114 @@ asyncWebRequest.dispatch() ─────────────────�
 
 ASYNC 派发只是容器叫应用“回来收尾”，这时候 `wrapper1` 的缓存已经写满了，而你手上刚 new 出来的是 `wrapper2`——空的。
 
-要补救，就得把包装器**跨派发传递**过去：
+### 4.1 先把两个 `isAsync` 方法分清
+
+那正确姿势是什么？在给出代码之前，得先把两个以 `isAsync` 开头、名字极像的方法分清，不然后面很容易读晕。它们不是业务代码，而是 `OncePerRequestFilter` 留给子类的两个工具方法：
 
 ```java
-public class TraceFilter implements Filter {
+/** 这一趟是不是“异步完成之后被叫回来”的那一趟 */
+protected boolean isAsyncDispatch(HttpServletRequest request) {
+    return DispatcherType.ASYNC.equals(request.getDispatcherType());
+}
 
-    private static final String WRAPPER_ATTR = TraceFilter.class.getName() + ".WRAPPER";
+/** 请求是否已经进入异步模式 —— 为 true 意味着“当前这一趟不是最后一趟” */
+protected boolean isAsyncStarted(HttpServletRequest request) {
+    return WebAsyncUtils.getAsyncManager(request).isConcurrentHandlingStarted();
+}
+```
+
+`OncePerRequestFilter` 的类注释把两者的分工写得很直白：
+
+> Subclasses may use `isAsyncDispatch` to determine **when a filter is invoked as part of an async dispatch**, and use `isAsyncStarted` to determine **when the request has been placed in async mode and therefore the current dispatch won't be the last one for the given request**.
+
+翻成两句话就不会再混：
+
+- **`isAsyncDispatch` 看的是“我是哪一趟”**——读 `DispatcherType`，等于 `ASYNC` 就说明这一趟是异步完成后的收尾趟。
+- **`isAsyncStarted` 看的是“活儿交出去了没有”**——读异步状态；它返回 `true` 的准确含义是**“后面还有一趟”**，所以此刻不该急着收尾。
+
+放进同一个请求的生命周期里对比：
+
+| 时刻 | `isAsyncDispatch` | `isAsyncStarted` |
+|:---|:---:|:---:|
+| 普通同步请求，`chain.doFilter` 返回后 | `false` | `false` |
+| `StreamingResponseBody` 的 REQUEST 派发，`chain.doFilter` 返回后 | `false` | **`true`** |
+| 同一个请求的 ASYNC 派发（收尾那一趟） | **`true`** | `false` |
+
+第二行就是这次故障的现场：**`dispatcherType` 还是 `REQUEST`，异步却已经启动，响应随时可能被另一个线程写。** 只判断“是不是 ASYNC 派发”是不够的，两个都得看。
+
+第三行同样反直觉：ASYNC 派发那一趟名字里带 async，`isAsyncStarted()` 却返回 `false`——异步已经完成，容器才把请求交回来收尾，这一趟就是最后一趟。
+
+### 4.2 包装器不用自己传，Spring 已经传了
+
+分清这两个方法之后，修复思路就清楚了：**不需要把包装器存进 request attribute，Spring 已经把包装器传下去了。**
+
+关键在 `StandardServletAsyncWebRequest#startAsync`——它用的是 `startAsync` 的**两参数版本**，把当前的请求和响应对象（也就是 Filter 包装过的那些）显式交给了容器：
+
+```java
+this.asyncContext = getRequest().startAsync(getRequest(), getResponse());
+```
+
+而 Tomcat 会把这两个对象存进 `AsyncContext`，异步派发时原样交回来：
+
+```java
+// org.apache.catalina.connector.Request
+public AsyncContext startAsync(ServletRequest request, ServletResponse response) {
+    // ...
+    asyncContext.setStarted(getContext(), request, response,
+            request == getRequest() && response == getResponse().getResponse());
+    // ...
+    return asyncContext;
+}
+```
+
+所以**收尾趟拿到的 `response`，本来就是第一次那个 `wrapper1`**。要做的是两件事：
+
+1. 让 Filter 有机会在收尾趟跑起来——注册 `DispatcherType.ASYNC`；或者继承 `OncePerRequestFilter` 并把 `shouldNotFilterAsyncDispatch()` 重写为 `false`（Spring Boot 对 `OncePerRequestFilter` 会默认注册全部派发类型）；
+2. 收尾趟里把 `wrapper1` 的缓存倒出去。
+
+按这套“两趟分工”改写，就是标准的异步安全写法：
+
+```java
+public class TraceFilter extends OncePerRequestFilter {
+
+    /** 收尾趟也要进来 */
+    @Override
+    protected boolean shouldNotFilterAsyncDispatch() {
+        return false;
+    }
 
     @Override
-    public void doFilter(ServletRequest servletRequest, ServletResponse servletResponse,
-                         FilterChain chain) throws IOException, ServletException {
-        HttpServletRequest request = (HttpServletRequest) servletRequest;
-        HttpServletResponse response = (HttpServletResponse) servletResponse;
-
-        if (request.getDispatcherType() == DispatcherType.ASYNC) {
-            // 异步派发：取出第一次请求时缓存的包装器，补上写回
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                                    FilterChain chain) throws IOException, ServletException {
+        if (isAsyncDispatch(request)) {
+            // 收尾趟：response 就是第一次那个包装器，把缓存里的字节倒出去
             ContentCachingResponseWrapper wrapper =
-                    (ContentCachingResponseWrapper) request.getAttribute(WRAPPER_ATTR);
+                    WebUtils.getNativeResponse(response, ContentCachingResponseWrapper.class);
+            chain.doFilter(request, response);
             if (wrapper != null) {
                 this.print(wrapper, request);
                 wrapper.copyBodyToResponse();
-                request.removeAttribute(WRAPPER_ATTR);
             }
-            chain.doFilter(request, response);
             return;
         }
 
-        // REQUEST 派发：创建包装器并挂到 request 上，供异步派发使用
+        // 请求趟：只包装，不收尾
         ContentCachingResponseWrapper responseWrapper =
                 new ContentCachingResponseWrapper(response);
-        request.setAttribute(WRAPPER_ATTR, responseWrapper);
         // ... 省略 MDC 与请求包装
         chain.doFilter(request, responseWrapper);
+
+        if (!isAsyncStarted(request)) {     // 异步已启动 → 响应还没写完，别收尾
+            this.print(responseWrapper, request);
+            responseWrapper.copyBodyToResponse();
+        }
     }
 }
 ```
 
-还要记得注册 `ASYNC` 派发，否则上面那个分支永远进不去：
+这里用 `WebUtils.getNativeResponse` 而不是直接强转，是因为容器在异步派发时可能在外面再包一层 `ApplicationHttpResponse`；这个方法会顺着包装链找到真正的 `ContentCachingResponseWrapper`。
 
-```java
-@Bean
-public FilterRegistrationBean<TraceFilter> traceFilterRegistration(TraceFilter filter) {
-    FilterRegistrationBean<TraceFilter> registration = new FilterRegistrationBean<>(filter);
-    registration.setDispatcherTypes(DispatcherType.REQUEST, DispatcherType.ASYNC);
-    return registration;
-}
-```
-
-这段代码能跑通，但**不建议把它当首选修法**：它依赖“异步任务在 ASYNC 派发之前写完”这个隐含时序（对本例成立，但它是一份没有被任何接口承诺的契约），并且让 Filter 从无状态变成了跨派发持有状态，`request.removeAttribute` 一旦漏掉就是内存泄漏。
+但**仍然不建议把它当首选修法**：它要求响应体完整躺在内存里，还依赖“异步任务在 ASYNC 派发之前写完”这个隐含时序（对本例成立，但它不是任何接口承诺的契约）。而且它只是“把 `ContentCachingResponseWrapper` 用对了”，并没有消除“先攒后发”这个模型本身的代价。
 
 更根本的问题是：**这一整类麻烦，其实都可以通过“换个包装策略”绕开。**
 
@@ -520,7 +580,7 @@ private static boolean isContentCachingDisabled(HttpServletRequest request) {
 
 **包装本身没有问题，“取流”这个动作必须留一个可以反悔的入口。** 又因为 `disableContentCaching(request)` 写在 `outputMessage.getBody()` 之前，这个入口在正确的时刻被命中。
 
-`ShallowEtagHeaderFilter#doFilterInternal` 本身也是标准的“异步安全”写法，两道保险很清楚：
+在上一节分清 `isAsyncDispatch` 和 `isAsyncStarted` 之后，再读 `ShallowEtagHeaderFilter#doFilterInternal` 就清楚了：
 
 ```java
 @Override
@@ -540,11 +600,26 @@ protected void doFilterInternal(HttpServletRequest request, HttpServletResponse 
 }
 ```
 
-① `isAsyncDispatch(request)`：异步派发时不再重复包装，避免套两层。
+① `isAsyncDispatch(request)`：这一趟是异步派发的收尾趟，不要再新包一层缓存——`response` 此时已经是上一趟建好的那个包装器了。
 
-② `isAsyncStarted(request)`：如果 `chain.doFilter` 返回时请求已经进入异步模式，说明响应还没写完，这时候做任何“读缓存 + 写回”都是错的。
+② `isAsyncStarted(request)`：`chain.doFilter` 返回时异步已经启动，说明响应还没写完，此刻读缓存、写回都是错的。
 
-这两行正是本故障 Filter 缺的东西。但要说清楚：**② 只能阻止“做错事”，不能让数据自动流出去。** 只加 `isAsyncStarted` 判断、继续用裸的 `ContentCachingResponseWrapper`，结果只是把“偶尔 0 字节”变成“稳定的 0 字节”。真正的解法在 ① 那个取流的入口上。
+还有第三块拼图容易被漏掉：`ShallowEtagHeaderFilter` 把 `shouldNotFilterAsyncDispatch()` 重写成了 `false`：
+
+```java
+/**
+ * The default value is {@code false} so that the filter may delay the generation
+ * of an ETag until the last asynchronously dispatched thread.
+ */
+@Override
+protected boolean shouldNotFilterAsyncDispatch() {
+    return false;
+}
+```
+
+`OncePerRequestFilter` 默认返回 `true`（跳过异步派发），这里改成 `false`，注释把目的写得很清楚：**把 ETag 的计算推迟到最后那趟异步派发线程上去做**。于是它形成“两趟分工”——请求趟只包装、不收尾，异步派发趟才收尾。
+
+这三块拼在一起，才是 Spring 对“包装器 + 异步”的完整答案：请求趟不提前收尾，收尾趟回来把缓存倒出去，同时给取流留一个逃生口——本故障的 Filter 三块都没有。但要说清楚：**② 只能阻止“做错事”，不能让数据自动流出去。** 只加 `isAsyncStarted` 判断、继续用裸的 `ContentCachingResponseWrapper`，结果只是把“偶尔 0 字节”变成“稳定的 0 字节”。真正的解法仍是那个取流的入口。
 
 ## 六、四种修法
 
@@ -701,9 +776,9 @@ log.info("uri={} status={} bodyPreview={}", request.getRequestURI(),
 
 代价也要说清楚：`isReady()` / `setWriteListener()` / `flush()` 必须老老实实委托给原始流，漏掉任何一个都会让异步非阻塞写出问题；`getCharacterEncoding()` 拿到的编码可能和实际响应编码不一致，用 `getCapturedBody()` 做字符串转换时要留意；另外你失去了 `getContentSize()` 这类现成方法，要记录“实际写了多少字节”得自己在 `write` 里累加。
 
-### 6.4 异步感知 + 跨派发传递 wrapper（保留原语义）
+### 6.4 异步感知 + 两趟分工（保留原语义）
 
-也就是第四节那段代码。只有当你已经深度依赖 `ContentCachingResponseWrapper` 的语义——比如需要拿到**完整**响应体做校验或签名——才值得考虑。而且要接受两个前提：响应体必须能完整放进内存；注册时必须带上 `DispatcherType.ASYNC`。
+也就是 4.2 的写法：继承 `OncePerRequestFilter`，用 `isAsyncDispatch` / `isAsyncStarted` 把请求趟和收尾趟分开，收尾趟再从包装链里取出那个 `ContentCachingResponseWrapper` 写回。只有当你已经深度依赖它的语义——比如需要拿到**完整**响应体做校验或签名——才值得考虑。代价是响应体必须能完整放进内存，而且它只是把 `ContentCachingResponseWrapper` 用对了，“先攒后发”这个模型本身的代价并没有消失。
 
 ### 6.5 简单对照
 
@@ -712,7 +787,7 @@ log.info("uri={} status={} bodyPreview={}", request.getRequestURI(),
 | 6.1 不包装 response | ✅ | ✅ | 元信息，无响应体 | 无 | 极小 |
 | 6.2 路径白名单 | ✅ | ✅ | 完整（仅非流式接口） | 大响应仍占内存 | 小 |
 | 6.3 透写 + 旁路缓存 | ✅ | ✅ | 前 64KB | 可控 | 中 |
-| 6.4 跨派发传 wrapper | ✅ | ✅ | 完整 | 必须放得下内存 | 中 |
+| 6.4 两趟分工 + 原包装器 | ✅ | ✅ | 完整 | 必须放得下内存 | 中 |
 | 只加 `isAsyncStarted` 判断 | ❌ | ❌ | 无 | 大响应仍占内存 | 极小 |
 
 ## 七、这类 bug 的一般形态
@@ -788,7 +863,7 @@ log.info("uri={} dispatcherType={} asyncStarted={} cachedSize={}",
 - **状态码和头都对，为什么没有字节？** 因为头是写在 `ContentCachingResponseWrapper` 上的，它会透传给原始响应；而响应体被 `write` 关进了 `FastByteArrayOutputStream`，唯一的出口 `copyBodyToResponse()` 执行时缓存还是空的。
 - **流被谁接走了？** 被 `StreamingResponseBodyReturnValueHandler` 取走的 `outputMessage.getBody()`——它在 Controller 返回的那一刻，就从当前 response（也就是包装器）上要走了缓存流，然后交给异步线程。
 - **为什么时好时坏？** `startAsync()` 在 `chain.doFilter` 返回之前就执行了，Filter 的收尾代码和异步任务并发，谁先谁后看调度。
-- **加 `DispatcherType.ASYNC` 判断能救吗？** 单独加不行，ASYNC 派发时数据早就写在第一次的包装器里了；必须把包装器跨派发传递过去才行。
+- **加 `DispatcherType.ASYNC` 判断能救吗？** 光加判断不够——ASYNC 派发时数据早就写在第一次那个包装器里了，新建一个包装器只会拿到空的。得按“两趟分工”来：请求趟只包装、不收尾，收尾趟取出第一次那个包装器写回。
 - **正确写法是什么？** 要么不缓存响应体，要么用“透写 + 旁路缓存”的包装器；Spring 自己在 `ShallowEtagHeaderFilter` 里给出的范式是——包装可以，但取流入口必须能反悔。
 
 最后留一句给所有写统一 Filter 的人：**Filter 是环绕式的，但“环绕”的终点不等于“响应写完了”。** 在 Servlet 异步面前，容器线程的 `chain.doFilter` 返回只是一个中转站，不是终点站。
