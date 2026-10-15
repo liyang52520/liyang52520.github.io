@@ -370,7 +370,7 @@ private boolean skipDispatch(HttpServletRequest request) {
 
 两条路都通向同一个结果：**Filter 的逻辑只会执行一次，`copyBodyToResponse()` 也只会被调用一次。**
 
-退一步说，就算真的在异步派发里又进了 Filter，也救不回来。因为 `Async` 派发回到 `DispatcherServlet` 后，Controller 并不会被真正重新执行——`RequestMappingHandlerAdapter#invokeHandlerMethod` 会复用第一次的 `ModelAndViewContainer`：
+退一步说，就算真的在异步派发里又进了 Filter，也不会有新的字节被写出来。因为 `Async` 派发回到 `DispatcherServlet` 后，Controller 并不会被真正重新执行——`RequestMappingHandlerAdapter#invokeHandlerMethod` 会复用第一次的 `ModelAndViewContainer`：
 
 ```java
 if (asyncManager.hasConcurrentResult()) {
@@ -395,9 +395,9 @@ if (returnValue == null) {
 
 **异步派发这一趟，不会再有任何一次写响应体的动作。**
 
-## 四、光加一个 async 判断，为什么不够
+## 四、等看到 ASYNC，已经晚了
 
-很自然的想法是：Filter 里补一个派发类型判断，异步场景单独处理。
+很自然的想法是：既然是异步惹的祸，那就在 Filter 里补一个派发类型判断，异步场景单独处理。
 
 ```java
 if (request.getDispatcherType() == DispatcherType.ASYNC) {
@@ -408,80 +408,34 @@ if (request.getDispatcherType() == DispatcherType.ASYNC) {
 }
 ```
 
-没用。原因是**数据写入发生在异步派发之前**：
+先说最直接的问题：**这段代码根本不会被执行。** 3.3 节已经说过，直接实现 `Filter` 接口的 Bean，Spring Boot 默认只注册 `REQUEST` 派发，ASYNC 那一趟压根进不来。所以它给人的感觉是“明明加了判断，还是没用”——实际上是一行都没跑。
+
+那退一步，把它注册上 `DispatcherType.ASYNC`，就能救回来吗？仍然不能。看这一趟请求的派发类型就够了：
 
 ```text
-REQUEST 派发 ──► handleReturnValue：取流 + startAsync ──► 异步线程写数据（进 wrapper1 缓存）
-                                                        │
-asyncWebRequest.dispatch() ─────────────────────────────► ASYNC 派发：才轮到 Filter
+第 1 趟   DispatcherType = REQUEST   ← 包装器在这里创建，startAsync() 也在这里发生；
+                                       之后异步线程把数据写进这个包装器
+第 2 趟   DispatcherType = ASYNC     ← 容器才回来收尾，Filter 才有机会再跑一次
 ```
 
-ASYNC 派发只是容器叫应用“回来收尾”，这时候 `wrapper1` 的缓存已经写满了，而你手上刚 new 出来的是 `wrapper2`——空的。
+**你只有在第 2 趟才看得到 `ASYNC`，而字节早在第 1 趟之后就被异步线程写完了；写进去的还是第 1 趟那个包装器，你在这一趟 new 出来的新包装器是空的。** 想“在 ASYNC 分支里补救”，补救的对象已经不在手上了。
 
-### 4.1 先把两个 `isAsync` 方法分清
+所以正确做法不是新建一个包装器，而是**把第 1 趟那个包装器拿回来**。
 
-那正确姿势是什么？在给出代码之前，得先把两个以 `isAsync` 开头、名字极像的方法分清，不然后面很容易读晕。它们不是业务代码，而是 `OncePerRequestFilter` 留给子类的两个工具方法：
-
-```java
-/** 这一趟是不是“异步完成之后被叫回来”的那一趟 */
-protected boolean isAsyncDispatch(HttpServletRequest request) {
-    return DispatcherType.ASYNC.equals(request.getDispatcherType());
-}
-
-/** 请求是否已经进入异步模式 —— 为 true 意味着“当前这一趟不是最后一趟” */
-protected boolean isAsyncStarted(HttpServletRequest request) {
-    return WebAsyncUtils.getAsyncManager(request).isConcurrentHandlingStarted();
-}
-```
-
-`OncePerRequestFilter` 的类注释把两者的分工写得很直白：
-
-> Subclasses may use `isAsyncDispatch` to determine **when a filter is invoked as part of an async dispatch**, and use `isAsyncStarted` to determine **when the request has been placed in async mode and therefore the current dispatch won't be the last one for the given request**.
-
-翻成两句话就不会再混：
-
-- **`isAsyncDispatch` 看的是“我是哪一趟”**——读 `DispatcherType`，等于 `ASYNC` 就说明这一趟是异步完成后的收尾趟。
-- **`isAsyncStarted` 看的是“活儿交出去了没有”**——读异步状态；它返回 `true` 的准确含义是**“后面还有一趟”**，所以此刻不该急着收尾。
-
-放进同一个请求的生命周期里对比：
-
-| 时刻 | `isAsyncDispatch` | `isAsyncStarted` |
-|:---|:---:|:---:|
-| 普通同步请求，`chain.doFilter` 返回后 | `false` | `false` |
-| `StreamingResponseBody` 的 REQUEST 派发，`chain.doFilter` 返回后 | `false` | **`true`** |
-| 同一个请求的 ASYNC 派发（收尾那一趟） | **`true`** | `false` |
-
-第二行就是这次故障的现场：**`dispatcherType` 还是 `REQUEST`，异步却已经启动，响应随时可能被另一个线程写。** 只判断“是不是 ASYNC 派发”是不够的，两个都得看。
-
-第三行同样反直觉：ASYNC 派发那一趟名字里带 async，`isAsyncStarted()` 却返回 `false`——异步已经完成，容器才把请求交回来收尾，这一趟就是最后一趟。
-
-### 4.2 包装器不用自己传，Spring 已经传了
-
-分清这两个方法之后，修复思路就清楚了：**不需要把包装器存进 request attribute，Spring 已经把包装器传下去了。**
-
-关键在 `StandardServletAsyncWebRequest#startAsync`——它用的是 `startAsync` 的**两参数版本**，把当前的请求和响应对象（也就是 Filter 包装过的那些）显式交给了容器：
+好消息是它本来就会被传回来。`StandardServletAsyncWebRequest#startAsync` 用的是 `startAsync` 的**两参数版本**，把当前的请求和响应对象（也就是 Filter 包装过的那些）显式交给了容器：
 
 ```java
 this.asyncContext = getRequest().startAsync(getRequest(), getResponse());
 ```
 
-而 Tomcat 会把这两个对象存进 `AsyncContext`，异步派发时原样交回来：
+Tomcat 会把这两个对象存进 `AsyncContext`，异步派发时原样交回来，于是收尾趟拿到的 `response`，就是第一次那个包装器。
 
-```java
-// org.apache.catalina.connector.Request
-public AsyncContext startAsync(ServletRequest request, ServletResponse response) {
-    // ...
-    asyncContext.setStarted(getContext(), request, response,
-            request == getRequest() && response == getResponse().getResponse());
-    // ...
-    return asyncContext;
-}
-```
+要把“两趟”分开，`OncePerRequestFilter` 已经备好了两个工具方法，用的时候理解成一句话就行：
 
-所以**收尾趟拿到的 `response`，本来就是第一次那个 `wrapper1`**。要做的是两件事：
+- `isAsyncDispatch(request)`：这一趟是不是 ASYNC 派发——等价于 `DispatcherType.ASYNC.equals(request.getDispatcherType())`。
+- `isAsyncStarted(request)`：异步是不是已经启动、还没结束。它返回 `true` 的含义是**“后面还有一趟”**，所以这一刻不该收尾。
 
-1. 让 Filter 有机会在收尾趟跑起来——注册 `DispatcherType.ASYNC`；或者继承 `OncePerRequestFilter` 并把 `shouldNotFilterAsyncDispatch()` 重写为 `false`（Spring Boot 对 `OncePerRequestFilter` 会默认注册全部派发类型）；
-2. 收尾趟里把 `wrapper1` 的缓存倒出去。
+（这两者不是一回事：在 ASYNC 收尾趟里，`isAsyncStarted()` 反而是 `false`——异步已经结束，这一趟就是最后一趟。）
 
 按这套“两趟分工”改写，就是标准的异步安全写法：
 
@@ -778,7 +732,7 @@ log.info("uri={} status={} bodyPreview={}", request.getRequestURI(),
 
 ### 6.4 异步感知 + 两趟分工（保留原语义）
 
-也就是 4.2 的写法：继承 `OncePerRequestFilter`，用 `isAsyncDispatch` / `isAsyncStarted` 把请求趟和收尾趟分开，收尾趟再从包装链里取出那个 `ContentCachingResponseWrapper` 写回。只有当你已经深度依赖它的语义——比如需要拿到**完整**响应体做校验或签名——才值得考虑。代价是响应体必须能完整放进内存，而且它只是把 `ContentCachingResponseWrapper` 用对了，“先攒后发”这个模型本身的代价并没有消失。
+也就是第四节的写法：继承 `OncePerRequestFilter`，用 `isAsyncDispatch` / `isAsyncStarted` 把请求趟和收尾趟分开，收尾趟再从包装链里取出那个 `ContentCachingResponseWrapper` 写回。只有当你已经深度依赖它的语义——比如需要拿到**完整**响应体做校验或签名——才值得考虑。代价是响应体必须能完整放进内存，而且它只是把 `ContentCachingResponseWrapper` 用对了，“先攒后发”这个模型本身的代价并没有消失。
 
 ### 6.5 简单对照
 
