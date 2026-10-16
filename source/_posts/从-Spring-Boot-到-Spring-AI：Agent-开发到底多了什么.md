@@ -233,9 +233,24 @@ public class OrderTools {
 |------|------|
 | `@Tool(name = ...)` | 覆盖工具名，默认取方法名 |
 | `@Tool(description = ...)` | 工具描述，**就是写给模型看的接口文档** |
-| `@Tool(returnDirect = true)` | 工具结果直接返回给调用方，不再回传给模型 |
+| `@Tool(returnDirect = true)` | 工具返回值**直接作为最终答复**，跳过回传模型那一轮 |
 | `@ToolParam(description = ...)` | 单个参数的说明 |
 | `@ToolParam(required = false)` | 声明参数可选，默认全部必填 |
+
+`returnDirect` 这个开关值得单独说一下，因为它**改变了循环的形状**。
+
+默认情况下，工具返回值只是给模型看的"原料"：执行完会被拼成 `role=tool` 消息发回模型，模型再转述成人话给用户——**用户从来没见过工具的原始输出**。开了 `returnDirect` 之后，执行完**不再发起第二轮模型请求**，框架直接把返回值包装成最终响应返回给你的代码，这一轮循环当场结束。1.x 是在 `OpenAiChatModel` 里用一个 `if/else` 分这两条路的，2.0 换成 `ToolCallingAdvisor` 之后行为不变——源码注释写得很直白："Return tool execution result directly to the application client instead of returning it to the LLM."
+
+什么时候该开？**当工具返回值本身就是"答案"的时候。** 比如它返回的是一段排好版的 Markdown、一条精确的 SQL、一个下载链接、一组交给前端渲染的 JSON——这类内容让模型"转述"一遍只会引入损失：它可能顺手改掉数字、把结构弄坏，还平白多花一次往返的钱。反过来，`getOrderStatus()` 返回 `{"status":"PAID"}` 这种，就需要模型翻译成人话，千万别开。
+
+两个容易踩的细节。第一，它是**对同一轮里所有被调用的工具取 AND**：
+
+```java
+// DefaultToolCallingManager：任何一个工具没标 returnDirect，整轮就是 false
+returnDirect = returnDirect && toolCallback.getToolMetadata().returnDirect();
+```
+
+也就是说，模型一轮里调了三个工具、只要有一个没标，就仍然走正常循环——因为模型还得综合这三份结果才能回答。第二，它只结束**当前这一轮**的循环，不是禁用循环：用户下一次提问，工具照样会被调。
 
 注册给 `ChatClient` 只需要一行：
 
