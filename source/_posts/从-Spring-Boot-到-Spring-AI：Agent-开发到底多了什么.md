@@ -955,7 +955,7 @@ Spring AI 做的事，是用你熟悉的方式把这三样交到你手上：`@To
 ### 延伸阅读
 
 - [Spring 接入点：跟着容器过一生](/2026/09/11/Spring-接入点：跟着容器过一生/)——本文 5.2 节讲的 starter 与自动配置，那里有完整的容器启动时间线；想搞清 `ChatClient.Builder` 这类 Bean 是何时被造出来的，看它。
-- [SpringBoot 的一次完整请求发生了什么？](/2026/08/26/SpringBoot的一次完整请求发生了什么？/)——本文把 Advisor 类比成 Filter 链，那篇文章的第四节和第十一节可以对着看，理解"链式拦截 + 末端执行"这个结构。
+- [SpringBoot 的一次完整请求发生了什么？](/2026/08/26/SpringBoot的一次完整请求发生了什么？/)——本文把 Advisor 类比成 Filter 链，那篇文章的第五节和第十二节可以对着看，理解"链式拦截 + 末端执行"这个结构。
 - [深入理解 Spring WebFlux 与 Reactor Netty](/2026/09/15/深入理解-Spring-WebFlux-与-Reactor-Netty/)——本文 5.5 节的流式接口返回 `Flux<String>`，订阅模型、线程归属、为什么不能手动 `subscribe`，都在那里。
 - [一次下载失败排查：被 Filter 吞掉的异步响应流](/2026/10/14/一次下载失败排查：被 Filter 吞掉的异步响应流/)——同样是流式响应，同样卡在 Filter/Advisor 这一层。Agent 的流式接口出问题时，排查思路可以复用。
 - [ReAct: Synergizing Reasoning and Acting in Language Models](https://arxiv.org/abs/2210.03629)（arXiv:2210.03629）——3.1 节引用的论文原文与失败案例分析都在这里。

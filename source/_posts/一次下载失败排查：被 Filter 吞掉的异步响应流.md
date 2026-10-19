@@ -826,4 +826,4 @@ log.info("uri={} dispatcherType={} asyncStarted={} cachedSize={}",
 
 - [Spring 文件下载全方案深度解析](/2026/09/15/Spring-文件下载全方案深度解析/)——3.4 节讲 `StreamingResponseBody` 把阻塞转移到哪里，3.5 节讲 `DeferredResult` 与它的叠加用法，正好是本文的前置知识。
 - [Spring MVC 中那些“不走寻常路”的返回类型](/2026/09/14/Spring-MVC-中那些“不走寻常路”的返回类型/)——8.3 节把 Servlet 3.0 `AsyncContext` 的两次派发讲透了，理解“ASYNC 派发只是回来收尾”要靠它。
-- [SpringBoot 的一次完整请求发生了什么？](/2026/08/26/SpringBoot的一次完整请求发生了什么？/)——第四节是 Filter 层，第十一节是异步请求，可以对着看 Filter 在请求生命周期里的位置。
+- [SpringBoot 的一次完整请求发生了什么？](/2026/08/26/SpringBoot的一次完整请求发生了什么？/)——第五节是 Filter 层，第十二节是异步请求，可以对着看 Filter 在请求生命周期里的位置。
