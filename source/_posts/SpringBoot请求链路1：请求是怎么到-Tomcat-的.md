@@ -1,6 +1,6 @@
 ---
 title: "SpringBoot 请求链路（一）：请求是怎么到 Tomcat 的"
-date: 2026-08-26 13:51:17
+date: 2026-08-26 13:51:16
 tags:
   - spring
   - tomcat

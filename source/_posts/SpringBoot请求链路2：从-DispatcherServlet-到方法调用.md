@@ -1,6 +1,6 @@
 ---
 title: "SpringBoot 请求链路（二）：从 DispatcherServlet 到方法调用"
-date: 2026-08-26 13:51:16
+date: 2026-08-26 13:51:17
 tags:
   - spring
   - tomcat
