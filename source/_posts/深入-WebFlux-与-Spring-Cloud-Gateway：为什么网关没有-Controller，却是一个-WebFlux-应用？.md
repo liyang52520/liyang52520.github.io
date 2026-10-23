@@ -2,7 +2,11 @@
 title: 深入 WebFlux 与 Spring Cloud Gateway：为什么网关没有 Controller，却是一个 WebFlux 应用？
 date: 2026-09-21 17:28:55
 tags:
+  - spring
+  - spring webFlux
+  - spring cloud gateway
 categories:
+  - develop
 ---
 
 ## 一个真实的困惑
