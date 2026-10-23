@@ -12,8 +12,8 @@ categories:
 
 > - 一个上传请求，从 Nginx 到对象存储，中间有几道限额？分别由谁拦下？
 > - 为什么被拒绝之后，客户端看到的是"连接被重置"而不是一个 413？
-> - `maxSwallowSize` 是干什么的？为什么它能让应用连一句日志都留不下？
-> - `@ExceptionHandler` 明明写了，为什么没被调用？
+> - Tomcat 有个 `maxSwallowSize`（"最多替客户端吞掉多少请求体"）——它为什么能让应用连一句日志都留不下？
+> - 为什么写在 Controller 里的异常处理方法，明明写了却没被调用？
 > - 上传一定要先落到本地临时文件吗？能不能边收边写进对象存储？
 > - 预签名 URL 直传和"应用流式转发"差在哪里，代价是什么？
 > - `MultipartFile.getOriginalFilename()` 到底能不能信？
@@ -23,6 +23,8 @@ categories:
 ## 六、四道限额，四种失败表现
 
 ### 6.1 全链路图
+
+先建立全局地图，后面每节只拆一层。
 
 ```text
 浏览器
@@ -42,6 +44,8 @@ DispatcherServlet ──► ④ maxSwallowSize  默认 2 MiB  拦在连接层，
 最反直觉的一点：**越靠外的限制，越容易让客户端拿不到一个像样的响应。**
 
 ### 6.2 第一道：Nginx 的 `client_max_body_size`
+
+四道限额里最外面的一道，由 Nginx 自己说话。
 
 ```nginx
 location /api/upload {
@@ -71,7 +75,7 @@ location /api/upload {
 // org.apache.catalina.connector.Request#parseParts（Tomcat 10.1.x）
 if (part.getSubmittedFileName() == null) {          // ← 没有文件名 = 普通表单字段
     if (maxPostSize >= 0) {
-        // 原码用 Math.addExact 逐项累加：name 字节数 + 1 + value 字节数 + 1
+        // 原码用 Math.addExact 逐项累加
         postSize = name.getBytes(charset).length + 1 + part.getSize() + 1;
         if (postSize > maxPostSize) {
             parameters.setParseFailedReason(FailReason.POST_TOO_LARGE);
@@ -106,6 +110,8 @@ factory.addConnectorCustomizers(connector -> {
 调大前先算账。Tomcat 文档的内存估算公式是 `maxPartHeaderSize × maxPartCount × maxConnections × 2`——按默认值：`512 × 50 × 8192 × 2`，约 **400 MB**。这是文档明确提示的 DoS 面。
 
 ### 6.4 第三道：Spring 的 multipart 配置
+
+真正会送进 Tomcat 解析器的就是这几项：
 
 ```yaml
 spring:
@@ -149,7 +155,7 @@ if (contentLength > 0 && protocol.getMaxSwallowSize() > -1 &&
 }
 ```
 
-顺带一提，413 本身就会关掉 keep-alive：
+还有一环：413 本身就会关掉 keep-alive。
 
 ```java
 // Http11Processor#statusDropsConnection
@@ -209,7 +215,7 @@ try {
 串起来，引子里的故障有了完整解释：
 
 1. 客户端发起 100 MB 上传，`Content-Length: 104857600`；
-2. `checkMultipart` 触发 `getParts()`，Tomcat 发现 `Content-Length > max-request-size`，抛 `SizeLimitExceededException`（还没开始读请求体）；
+2. `checkMultipart` 触发 `getParts()`，Tomcat 发现 `Content-Length > max-request-size`，抛出 `SizeLimitExceededException`（还没开始读请求体）；
 3. Spring 把它翻译成 `MaxUploadSizeExceededException`，写出 413；
 4. 请求体还剩约 100 MB，超过 `maxSwallowSize`：`checkMaxSwallowSize()` 关掉 keep-alive；
 5. `IdentityInputFilter.end()` 吞到第 2 MiB 时抛 `IOException`；
@@ -224,7 +230,7 @@ try {
 |:---|:---|:---|:---|:---|
 | Nginx / 网关 | 请求体 > `client_max_body_size`（默认 1m） | `413` | Nginx 错误页；浏览器可能显示不了 | 无，请求没到应用 |
 | Tomcat `maxPostSize` | 表单字段累计超 2 MiB（文件不计） | 无固定值 | 取决于应用 | 默认无 |
-| Tomcat `maxPartCount` / `maxParameterCount` | part 或参数个数超限 | 无固定值（`FailedRequestFilter` → 400） | 取决于应用 | 默认无 |
+| Tomcat `maxPartCount` / `maxParameterCount` | part 或参数个数超限 | 无固定值（Tomcat 的 `FailedRequestFilter` → 400） | 取决于应用 | 默认无 |
 | Spring `max-file-size` / `max-request-size` | 单文件或请求体超限 | Boot 3.2+ 是 `413`；Boot 3.0/3.1 与 2.x 是 `500` | 可能拿到 413，也可能被重置 | 默认几乎无 |
 | Tomcat `maxSwallowSize` | 拒绝之后客户端还在发，剩余 > 2 MiB | **无** | `ERR_CONNECTION_RESET` | 默认无（DEBUG 才有） |
 
@@ -232,7 +238,7 @@ try {
 
 ## 七、为什么 `@ExceptionHandler` 接不住
 
-先给结论：它大多数时候能接住——接不住的是另外几种情况。要分清，得先知道异常在哪里、以什么类型、在哪个时机抛出来。
+`@ExceptionHandler` 是 Spring MVC 里"在一个 handler 类（Controller 或全局 advice）上声明「我来处理这个异常」"的那套机制。先给结论：它大多数时候能接住——接不住的是另外几种情况。要分清，得先知道异常在哪里、以什么类型、在哪个时机抛出来。
 
 ### 7.1 原始形态：不是 Spring 的异常
 
@@ -245,7 +251,6 @@ if (requestSize != -1 && requestSize > sizeMax) {
 }
 
 // impl/FileItemStreamImpl（构造时；max-file-size）
-// 注意：异常被 FileUploadIOException 包了一层，7.2 会拆开
 if (fileSizeMax != -1 && pContentLength != -1 && pContentLength > fileSizeMax) {
     e.setFileName(pName);
     e.setFieldName(pFieldName);
@@ -253,7 +258,7 @@ if (fileSizeMax != -1 && pContentLength != -1 && pContentLength > fileSizeMax) {
 }
 ```
 
-注意第一个抛点：**它拿 `Content-Length` 先判，body 一个字节都没读。** 这是 Tomcat 自带的"快速拒绝"，不需要你写。此外还有两处兜底：`Content-Length` 缺席（chunked）时，`FileItemStreamImpl$LimitedInputStream#raiseError` 会在读到超限时抛出；part 头部超 `maxPartHeaderSize` 则由 `MultipartStream#readHeaders` 抛出。异常层级是：
+注意第一个抛点：**它拿 `Content-Length` 先判，body 一个字节都没读。** 这是 Tomcat 自带的"快速拒绝"，不需要你写。此外还有两处兜底：`Content-Length` 缺席（chunked）时，`FileItemStreamImpl$LimitedInputStream#raiseError`（流式读取时的兜底校验）会在读到超限时抛出；part 头部超 `maxPartHeaderSize` 则由 `MultipartStream#readHeaders`（解析 part 头部的那一段）抛出。异常层级是：
 
 ```text
 FileUploadException
@@ -319,6 +324,8 @@ protected void handleParseFailure(Throwable ex) {
 
 ### 7.3 时机：`checkMultipart` 跑在 `getHandler` 之前
 
+先看这段顺序——后面所有"接不住"都由它决定。
+
 ```java
 // DispatcherServlet#doDispatch
 try {
@@ -349,7 +356,7 @@ for (Map.Entry<ControllerAdviceBean, ExceptionHandlerMethodResolver> entry : thi
 
 结论很硬：**写在 Controller 里的 `@ExceptionHandler(MaxUploadSizeExceededException.class)` 不会被执行，只有全局 `@ControllerAdvice` 的会。** 因为异常在"知道该由哪个 Controller 处理"之前就抛出来了。
 
-顺带一个能解释"行为不一致"的开关：把 `resolve-lazily` 设成 `true`，解析推迟到参数解析阶段，那时 `handlerMethod` 已经有值，Controller 里的局部处理器就能生效了。同一个异常，换个配置换条路径。
+还有一个开关能解释这种"行为不一致"：把 `resolve-lazily` 设成 `true`，解析推迟到参数解析阶段，那时 `handlerMethod` 已经有值，Controller 里的局部处理器就能生效了。同一个异常，换个配置换条路径。
 
 ### 7.4 没人接也不会是 500（Spring 6.1 / Boot 3.2 起）
 
@@ -391,7 +398,7 @@ if (!response.isCommitted()) {
 |:---|:---|
 | 请求被 Nginx / 网关拦下 | 应用根本没被调用，`DispatcherServlet` 没参与 |
 | 请求在 `DispatcherServlet` 之前被拒 | `MultipartFilter`、Servlet Filter、Tomcat 参数解析都在 handler 链之外 |
-| 响应已经 commit | `handleErrorResponse` 只在 `!response.isCommitted()` 时改状态码，否则只打一条 warn |
+| 响应已经 commit | `handleErrorResponse` 只在响应未提交时改状态码，已提交就只打一条 warn |
 | 连接已经被关 | 处理器可能跑了，但写出去的字节没人读——6.5 那条路 |
 
 第一类里有个容易踩的组合：`MultipartFilter` 在 DispatcherServlet **之前**解析 multipart，异常发生在 filter 里，`@ControllerAdvice` 完全看不到。
@@ -399,6 +406,8 @@ if (!response.isCommitted()) {
 ## 八、把「失败」变成可诊断的响应
 
 ### 8.1 全局 advice：让每次拒绝都留痕
+
+这份处理器只有三个方法，却正好补上 7.2 留下的两个缺口。
 
 ```java
 @RestControllerAdvice
@@ -484,7 +493,7 @@ location /api/upload {
 | 干脆不吞 | Context 属性 `swallowAbortedUploads = false`（`StandardContext` 默认 `true`） | 连接立即关闭，响应可能到不了客户端；线程立刻释放 |
 | 网关先拦 | `client_max_body_size` | 上限要和后端对齐 |
 
-第三行值得展开一句，因为它走的是另一条代码路径：`checkSwallowInput()` 只在 `swallowAbortedUploads` 为 false 时才真的下发 `DISABLE_SWALLOW_INPUT`；`AbstractProcessor` 收到后调 `disableSwallowRequest()` 并把状态置为 `CLOSE_CLEAN`（可写完响应、但连接必须关）。**这个开关默认是 `true`，所以默认路径不在这里**——默认走的是 6.5 那条"吞到上限再抛 `IOException`"的路。
+第三行值得展开一句，因为它走的是另一条代码路径：Tomcat `Request` 上的 `checkSwallowInput()` 只在 `swallowAbortedUploads` 为 false 时才真的下发 `DISABLE_SWALLOW_INPUT`；Tomcat `AbstractProcessor` 收到后调它自己的 `disableSwallowRequest()` 并把状态置为 `CLOSE_CLEAN`（可写完响应、但连接必须关）。**这个开关默认是 `true`，所以默认路径不在这里**——默认走的是 6.5 那条"吞到上限再抛 `IOException`"的路。
 
 生产上更稳的组合是**网关先拦 + 后端保留默认 `maxSwallowSize` + 拒绝路径写完整日志**：把"连接被重置"变成"客户端收到了 413 JSON"。
 
@@ -506,6 +515,8 @@ Files.deleteIfExists(tmp);                  // ③ 还得记得删
 一次上传，数据落两遍盘、读两遍。**这段代码里唯一必要的动作是第 ② 步。**
 
 ### 9.2 边收边写：把 part 的流直接交给 SDK
+
+把 9.1 里唯一必要的那一步单独写出来，就是一个完整实现：
 
 ```java
 @Service
@@ -613,7 +624,7 @@ AWS 文档给的硬数字要先拿来框住方案：**单次 PUT 最大 5 GB**�
 
 - **分片大小取多少。** 5 MiB 是下限不是建议值。片太小 → 请求数与元数据暴涨、合并变慢；片太大 → 单次失败的重传代价高。按"目标大小 ÷ 1000 片以内"反推，常见落在 8~64 MiB。
 - **并发与顺序。** 片之间独立，可以并发，但要限并发数，否则一条大上传能把出口带宽吃满。合并按 `partNumber` 排序，**所以完成顺序不影响结果**——这正是分片能并发的根本原因。
-- **断点续传。** 要持久化的只有两样：`uploadId` 和"哪些片已成功"。续传前用 `ListParts` 问一次服务端，比本地记录更可靠。
+- **断点续传。** 要持久化的只有两样：`uploadId` 和"哪些片已成功"。续传前用 S3 的 `ListParts` 问一次服务端，比本地记录更可靠。
 - **秒传。** 上传前先算整文件摘要，命中"摘要 → 对象"映射就直接建引用。四条取舍：客户端要能算摘要；摘要必须能**流式**算；服务端要防止"拿别人的摘要引用别人的文件"（至少校验对象大小）；分片上传时整文件摘要客户端不方便算，常见替代是用各片 ETag 拼出对象 ETag 对账。
 - **别忘回收。** 没有 complete 的 multipart upload 会一直占着存储和计费，要配生命周期规则定时中止。
 
@@ -640,6 +651,8 @@ AWS 文档给的硬数字要先拿来框住方案：**单次 PUT 最大 5 GB**�
 
 ### 10.2 服务端：只签一个 PUT
 
+服务端只做一件事——生成一个带签名的 PUT 地址：
+
 ```java
 @PostMapping("/presign")
 public Map<String, Object> presign(@RequestBody PresignRequest req) {
@@ -665,6 +678,8 @@ public Map<String, Object> presign(@RequestBody PresignRequest req) {
 把 `contentType` 和 `contentLength` 一起签进去是有意为之：**它们进入签名，客户端就改不动了。** 不签的话，一个"只允许传 2 MB 图片"的 URL 可以被拿去传别的东西。
 
 ### 10.3 客户端：浏览器直接 PUT
+
+客户端拿到的就是一个能直接 PUT 的 URL，全程不经过后端：
 
 ```javascript
 const meta = await fetch('/api/uploads/presign', {
@@ -773,7 +788,7 @@ try (InputStream in = file.getInputStream()) {
 ### 11.5 存储位置、临时目录、并发、审计
 
 - **绝不落在 webroot。** 上传目录不能位于 Tomcat 的 `webapps/`、`src/main/resources/static` 或任何被静态资源处理器覆盖的路径下。放进去等于给上传者开了一个可访问、可执行的入口。
-- **临时目录会先被打满。** `file-size-threshold` 默认 `0B`，part 直接落盘，并发上传大文件时先耗尽的往往是磁盘而不是内存。要么用 `multipart.location` 指到独立分区并配配额与监控，要么走预签名直传，本地根本不落。
+- **临时目录会先被打满。** `file-size-threshold` 默认 `0B`，part 直接落盘，并发上传大文件时先耗尽的往往是磁盘而不是内存。要么用 `spring.servlet.multipart.location` 指到独立分区并配配额与监控，要么走预签名直传，本地根本不落。
 - **并发与配额。** 上传是少数能同时把带宽、磁盘、线程吃满的接口。按用户/租户限流、限制单请求体积、限制同一账号并行的分片上传数。
 - **日志与审计。** 记全"谁、何时、传了什么、多大、结果如何"：对象 key、size、contentType、摘要、IP、租户。**记录前先过滤控制字符**（原始文件名可能带 `\u0000`）。最后一条：大文件上传失败时前后端各留一份记录——后端记拒绝原因，前端记 `ERR_CONNECTION_RESET`，否则就是引子里那种"三方各说各话"。
 
