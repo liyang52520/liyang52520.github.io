@@ -8,38 +8,41 @@ categories:
   - develop
 ---
 
-## 引子：同一项目里的两种表现——3MB 传不上去，200MB 却传上去了
+## 引子：3MB 传不上去，200MB 却传上去了
 
-同一个项目里有两个上传接口：`POST /upload`（Spring MVC + Tomcat）传一个 3MB 的 PDF 直接报错；另一个接口（Spring WebFlux，流式接收）却敢让人传 200MB 的视频。很多人第一反应是"配置没写对"——但更值得先问一句：**一个 200MB 的文件传到服务器上，它在某一刻到底躺在哪里？**
+同一个项目里有两个上传接口。一个用 Spring MVC 写的 `POST /upload`，传 3MB 的 PDF 会报错；另一个用 WebFlux 写的接口，用户往上传 200MB 的视频，什么事也没有。
 
-答案很反直觉：用 Spring Boot 的默认配置，一个上传请求里**每一个文件都会先落到磁盘上**，哪怕它只有 1 字节；而**这个临时文件什么时候被删，取决于请求什么时候走完，不取决于你什么时候把它存到自己的目录里**。
+遇到这种差别，第一反应通常是"哪个配置没写对"。先别急着翻配置，换一个问法：**一个文件正在上传的那几秒里，它究竟躺在服务器的什么地方？**
 
-这两件事，决定了上传链路上绝大多数"玄学问题"：临时目录被悄悄撑爆、异常抛出后临时文件残留、把文件存进了业务目录、临时文件却可能还占着空间。
+答案和直觉不太一样。用 Spring Boot 的默认配置，上传请求里的每一个文件都会先落到磁盘上，哪怕它只有 1 字节；而这个临时文件什么时候被删，取决于请求什么时候走完，不取决于你什么时候把它存到自己的目录里。
 
-> - Spring MVC 默认用哪个组件把 multipart 请求包装成可用的对象？真的是"classpath 里有 commons-fileupload 就自动切换"吗？
-> - 从 Boot 2.x 升到 3.x，"上传坏了"到底坏在哪儿？
-> - `multipart/form-data` 在字节层面长什么样？为什么不能像表单那样整体读进内存再解析？
-> - 解析发生在 Spring 里，还是 Tomcat 里？什么时候触发？
+这两件事，撑起了上传链路上绝大多数"玄学问题"：临时目录被慢慢撑爆、异常抛出后临时文件残留、文件已经存进业务目录了却还占着一份空间。
+
+> - `multipart/form-data` 在字节层面长什么样？为什么不能像普通表单那样整体读进内存再解析？
+> - 解析这件事是 Spring 干的，还是 Tomcat 干的？什么时候开始干？
+> - Spring MVC 默认用哪个组件把上传请求包装成可用的对象？为什么有的资料说"classpath 里有 commons-fileupload，它就会自动切换实现"？
 > - `MultipartFile` 的内容什么时候在内存、什么时候在磁盘？
 > - 临时文件是谁创建的、谁删除的、什么时机删？
-> - WebFlux 下为什么是完全不同的模型？它的限额又在哪几个配置项里？
+> - 同一个项目里，另一个走 WebFlux 的接口为什么反而敢收 200MB？
 
-这篇先把这条链路从头走一遍，看清楚"字节从网卡进来、到变成你手里的 `MultipartFile`"这段路。限额、故障排查和不落盘直传，留给下一篇。
+这篇按上面的顺序走一遍，看清"字节从网卡进来、到变成你手里的 `MultipartFile`"这段路。限额、故障排查和不落盘直传，留给下一篇。
+
+源码与配置以 Boot 3.2.x 为基线（按 3.2.12 的依赖清单，对应 Spring Framework 6.1.15、Tomcat 10.1.33）。
 
 > 和[Spring 文件下载全方案深度解析](/2026/09/15/Spring-文件下载全方案深度解析/)对照着看会有意思：下载是"我们从磁盘往网卡推字节"，上传是"我们从网卡往磁盘收字节"。方向一反过来，主动权、内存模型、临时文件的生命周期全都不一样。
 
 
-## 一、先看清报文：`multipart/form-data` 在字节层面长什么样
+## 一、先看清报文：上传请求在网线上到底是什么
 
-### 1.1 它不是一个"结构化的 JSON"，而是一段用分隔符切开的字节流
+### 1.1 一个 body 里装着好几样东西，靠 boundary 切开
 
-请求头里只有一行关键信息：
+写上传接口的时候，它看起来和普通表单没什么两样：字段有名字，文件字段也能起个名字。但真正发到网线上的东西，是另一个样子。请求头里只有一行关键信息：
 
 ```text
 Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
 ```
 
-`boundary` 是客户端随机生成的分隔串——它不属于内容，只是一把"刀"。body 里每个字段（part）的边界就是 `--` 加上这个串：
+`boundary` 是客户端随手生成的一串随机字符。它不属于内容，只是一把"刀"：body 里每个字段（part）靠 `--` 加上它来分界。
 
 ```text
 ------WebKitFormBoundary7MA4YWxkTrZu0gW
@@ -57,82 +60,85 @@ Content-Type: application/pdf
 
 三件事一眼可见：
 
-- **文本字段和二进制文件混在同一个 body 里**，靠 `Content-Disposition` 区分。带 `filename` 参数的是文件，不带的是普通表单字段。
-- 每个 part 有**自己的头部**（`Content-Type` 可省），头部和内容之间用一个空行分隔。
-- 结束标志是 `--boundary--`，比普通分隔多两个连字符。
+- 文本字段和二进制文件混在同一个 body 里。每个 part 有自己的头部，头部里的 `Content-Disposition` 描述"这个 part 叫什么名字、带不带文件名"：带 `filename` 的是文件，不带的是普通字段。
+- 头部和内容之间空一行。
+- 整个 body 以 `--boundary--` 结束，比普通分界多两个连字符。
 
-### 1.2 为什么不能复用 `application/x-www-form-urlencoded`
+### 1.2 上传得另起一套格式：普通表单装不下二进制，也存不住文件名
 
-`urlencoded` 把表单序列化成 `title=%E6%8A%A5%E5%91%8A&file=...`，一切内容都要能被百分号编码。二进制这么编码会膨胀到约 3 倍——按 RFC 3986，每个非保留字节都要变成 `%XX` 三个字符；即便先 Base64 再百分号编码，也还要叠加约 33%。而且它没法表达"文件名"这种元数据——这是 RFC 7578 另外定义 `multipart/form-data` 的直接原因。
+先退一步。表单提交本来就有一种格式，登录、搜索用的都是它：
 
-更麻烦的一点：**boundary 是在请求头里声明的，而它有可能碰巧出现在文件内容中**（概率极低但必须处理）。所以解析器不能"全局替换分隔符"，只能顺序扫描、按位置切分。
+```text
+Content-Type: application/x-www-form-urlencoded
 
-### 1.3 关键结论：body 必须边读边解析
-
-Tomcat 的解析器是这样一个状态机：读一块字节 → 在缓冲区内找下一个 `--boundary` → 找到后解析 part 头部 → 把这一段内容写入该 part 的目标。**它不能在解析之前先知道"这个文件有多大"**：文件大小只能靠一直读到下一个 boundary 才知道，而这个 boundary 只有读到那儿才出现。
-
-这带来两个后果，后文会反复用到：
-
-1. **内容必须在读取过程中就被决定去向。** 读到第 N 块字节时，解析器必须已经知道这一块是留在内存还是写进临时文件——不能攒到最后统一决定。
-2. **"读一点点就能拒绝"是做不到的**，除非对 `Content-Length` 做整体判断。所以按文件大小配置的上限，只能在字节流推进的过程中被触发。
-
-## 二、解析归谁做：Tomcat 读 body，Spring 只做包装
-
-第一章的结论是：**body 必须边读边解析**。它留下一个还没回答的问题——**这个"读"，是谁在读？**
-
-分清这一层，是为了回答后面几个很具体的问题：
-
-- `application.yml` 里的 `max-file-size`，凭什么能管住容器的解析？（2.4）
-- 为什么 Filter 里只是读一下请求参数，文件就会在进 Controller 前落盘？（2.2）
-- 上传留下的临时文件，谁创建、谁负责删？（第三章 3.6）
-- 超限抛出的异常，为什么写在 Controller 里的异常处理方法有时接不住？（第二篇第七节）
-
-四条指向同一个事实：**读 body 是容器的活，Spring 只是在外面包了一层**。顺序：谁在干（2.1~2.3）→ 配置怎么送到它手里（2.4）→ 升级时这条路变过什么（2.5）。
-
-### 2.1 Tomcat：`Request#parseParts` 是真正的劳动现场
-
-**先给结论**：逐字节读 body 的是 Tomcat，Spring 自己不做这件事。Servlet 3.0 之后容器负责解析 multipart，应用侧拿到的是 `jakarta.servlet.http.Part`（Boot 3 / Tomcat 10.1；Boot 2 / Tomcat 9 是 `javax.servlet.http.Part`）。Tomcat 的入口很直接：
-
-```java
-// org.apache.catalina.connector.Request#getParts
-@Override
-public Collection<Part> getParts() throws IOException, IllegalStateException, ServletException {
-    parseParts(true);          // ← explicit = true
-    if (partsParseException != null) { /* 按类型重抛 */ }
-    return parts;
-}
+title=%E4%B8%80%E4%BB%BD%E6%8A%A5%E5%91%8A&page=2
 ```
 
-`parseParts(boolean explicit)` 做的事，按顺序是：先看解析缓存（`parts != null` 就直接返回）、再取上传配置（`MultipartConfigElement`，Servlet 规范定义的那份）、决定临时目录、建好上传处理器，最后真正开始读 body、边读边切出每个 part。
+它的规矩是，所有内容都当文字处理，写不进 URL 的字节一律转义。上面那个"一"字在 body 里占了九个字符，因为它被拆成了 `%E4%B8%80`。
 
-取配置这一行是关键：
+把这套规矩用在上传上有两个问题。一是膨胀：几乎所有二进制字节都要转义，发出去的数据量会涨到三倍左右，3MB 的 PDF 要占 9MB 上下。二是它没有地方放文件名——这个格式只能表达"某个字段的值是什么"，说不出"这个字段是一个文件，它叫 report.pdf"。而服务端存盘的时候，文件名往往是唯一的线索。
+
+所以上传另起了一套格式，就是上一节那个 `multipart/form-data`：内容不再转义，原样拼进 body，字段之间用 boundary 隔开。
+
+### 1.3 格式这么定，解析就只能边读边做
+
+"原样拼进 body"这句话，把麻烦转交给了写解析器的人。
+
+boundary 是客户端随机生成的，服务端事先不知道，只能先从 `Content-Type` 里读出来。麻烦在于，这串字符理论上可以出现在文件内容当中——概率极低，但必须处理。所以解析器没有"先按分隔符把 body 切开、再一段段看"的余地，它只能从头往后扫：扫到下一个 boundary，才知道上一个字段到这里结束。
+
+这样一来，两件事就没得选。它事先不知道文件有多大，大小不在任何头部里，只有读到下一个 boundary 才能确定；它也不可能把整个 body 先攒进内存，一个 200MB 的视频没有地方放，几百个并发上传更会把服务撑垮。
+
+于是解析器在读第一块字节的时候，就得决定这块内容去哪：留在内存，还是写进磁盘上的临时文件。这个在读取途中做出的决定，是后面所有问题的源头。
+
+知道了 body 长什么样、解析器只能怎么读，接下来该问的是：这段"读"，是谁在干？
+
+## 二、谁在读这些字节：Tomcat 干活，Spring 只包一层
+
+第一章留下的问题是"谁在读"。分清这一层不是为了猎奇，它一次性回答了三个很具体的问题：
+
+> - 你写在 `application.yml` 里的上传上限，凭什么能管住容器的解析？
+> - 为什么 Filter 里只是读一下请求参数，文件就会在进 Controller 之前落盘？
+> - 上传留下的临时文件，谁创建、谁负责删？
+
+三个问题指向同一个事实：读 body 是容器的活，Spring 只是在外面包了一层。
+
+### 2.1 真正伸进 body 里读字节的，是 Tomcat 的 Request
+
+先给答案：不是 Spring 在读，是 Servlet 容器在读。Spring MVC 跑在 Tomcat 上时，真正逐字节扫 boundary、切 part、决定每段内容去哪的，是 Tomcat 的代码。
+
+在贴代码之前，先说清这些源码在哪。Tomcat 里代表"一个请求"的对象是 `org.apache.catalina.connector.Request`——可以把它想成 Tomcat 内部记这次请求的账本，body、参数、上传的 part 都记在上面；它来自 `tomcat-embed-core` 这个 jar，也就是 Spring Boot 内嵌 Tomcat 时用的那个。下面还会用到 `spring-webmvc`、`spring-web`、`spring-boot-autoconfigure`，它们在 IDEA 里按 `Cmd+O`（Windows 是 `Ctrl+N`）输入类名就能打开，提示下载源码时点一下即可。
+
+上传的解析入口，是 `Request` 上的 `parseParts`。它按顺序做四件事：先看解析结果有没有缓存（有就直接返回），再取这次上传的配置，接着决定临时目录、建好上传处理器，最后才真正开始读 body、边读边切出每个 part。
+
+其中"取配置"这一步最关键：
 
 ```java
 // org.apache.catalina.connector.Request#parseParts
 MultipartConfigElement mce = getWrapper().getMultipartConfigElement();
 if (mce == null) {
     if (context.getAllowCasualMultipartParsing()) {
-        // 没有 multipart-config 时，退回用 Connector 的 maxPostSize 当上限
+        // 没有单独配置上传规则时，退回用 Connector 的表单参数上限
         mce = new MultipartConfigElement(null, connector.getMaxPostSize(), ...);
     } else {
-        if (explicit) { partsParseException = new IllegalStateException(...); }  // 显式解析：抛
-        else { parts = Collections.emptyList(); }                               // 否则：退化成"没有 part"
+        if (explicit) { partsParseException = new IllegalStateException(...); } // 应用明确要 part：抛错
+        else { parts = Collections.emptyList(); }                              // 只是顺带解析：当作没有 part
         return;
     }
 }
 ```
 
-也就是说：**容器并不会"自己想"怎么做上传限制，限制全部来自挂在 servlet 上的 `MultipartConfigElement`**。没有它就报 `noMultipartConfig`。
+`MultipartConfigElement` 是一个 Servlet 规范定义的配置对象，装着四样东西：临时目录、单文件上限、整份请求上限、内存阈值。代码里的 `getWrapper()` 取到的，是当前这个 servlet 在容器里的包装对象，那份配置就挂在它上面。所以这段代码说明的是：容器不会自己决定上传怎么限制，**限制全部来自挂在 servlet 上的那份配置**；拿不到它，明确要 part 的场景就只能报错（报错信息是 `coyoteRequest.noMultipartConfig`，意思是"这个 servlet 没有配上传规则"）。
 
-### 2.2 触发时机：懒解析，而且有两个入口
+`getAllowCasualMultipartParsing()` 是 Tomcat 上的一个开关，默认关闭，允许"没配上传规则也照解析"；`maxPostSize` 是 Connector 限制表单参数总大小的上限（默认 2MB），在这里被拿来兜底。在 Spring Boot 的默认配置下，这两条都走不到——Boot 一定会把配置准备好，先记住这个缺口，2.4 会回来补。
 
-**先给结论**：解析不是一进 Tomcat 就发生的，它被懒触发——`parseParts` 有两个调用点，时机完全不同：
+### 2.2 什么时候开始读：谁先开口要，谁就触发解析
 
-- `getParts()` / `getPart(name)` → `parseParts(true)`，**显式请求**。Spring MVC 走的正是这条路。
-- `parseParameters()` 里，当 `Content-Type` 是 `multipart/form-data` 时 → `parseParts(false)`。
+Tomcat 不会在请求一进来就把 body 读掉（所有请求都是，不只是对于文件上传，body可能作为字节流存放在TCP 连接/内核缓冲区/Tomcat 连接器中）。它在等一个信号：有人开口要。
+
+要的方式有两种。第一种，要文件：某个组件调用 `Request#getParts()`，明确说"把上传的 part 给我"，这时 `parseParts` 收到的是 `true`。第二种，要参数：任何一处代码调用 `request.getParameter("...")`，比如使用注解@RequstParam读取表单内参数（也就是form-data），Tomcat 也会顺手把整份 body 解析掉——因为它得先读完，才能确认这些参数里有没有来自 form-data 的字段，这时 `parseParts` 收到的是 `false`。后者对应 `Request` 里"取参数"的入口 `parseParameters`：
 
 ```java
-// org.apache.catalina.connector.Request#parseParameters
+// org.apache.catalina.connector.Request#parseParameters（Tomcat 10.1.x 较新版本）
 String mediaType = MediaType.parseMediaTypeOnly(getContentType());
 if ("multipart/form-data".equals(mediaType)) {
     parseParts(false);
@@ -141,375 +147,215 @@ if ("multipart/form-data".equals(mediaType)) {
 }
 ```
 
-第二处的意义在于：**第一次调用 `request.getParameter(...)` 也会触发整份 body 的解析**。也就是说，一个写在 Filter/Interceptor 里的 `getParameter("x")`，就可能让上传的临时文件在 Controller 之前就落盘。这一点在排查"为什么还没进方法磁盘就涨了"时非常有用。也正因为 body 只会被读一次，这两个入口不能混用——它们是 Servlet 请求对象 `HttpServletRequest` 上的一对方法：`getParameter()` 取参数，`getInputStream()` 直接读原始 body，谁先读走，另一个就拿不到东西了。
+同一个 `parseParts`，一个被明确调用、一个被顺手调用，差别就在上一节那段代码里：拿不到上传配置时，明确要 part 会直接抛错，顺手解析则安静地返回一个空列表。
 
-再看 `parseParts` 内部第一行的短路条件——解析结果和解析异常都会被缓存：
+这里的坑在于：解析是一次性的，而且一次就是整份 body。所以在 Controller 执行之前，只要有一个 `getParameter` 路过，磁盘上就已经多出那个临时文件了。很多人问"我还没开始处理文件，磁盘怎么就先涨了"，答案常常就在这里。
 
-```java
-if (parts != null || partsParseException != null) {
-    return;   // 已经解析过（成功或失败），不再重复读 body
-}
-```
+还有一件事值得记住：body 只能被读一次。`getParameter()` 和 `getInputStream()` 都是 `HttpServletRequest` 上的方法，一个要把 body 当参数解析，一个要直接把原始字节交出来；谁先读走，另一个就拿不到完整内容了。
 
-### 2.3 Spring 侧：`MultipartResolver` 只是"包装者"，不是"解析者"
+### 2.3 Spring 只做包装：把 Part 套成 MultipartFile
 
-**先给结论**：Spring 侧一个字节都不解析，它只把原始请求包一层，真正的解析仍然发生在容器里。
+在知道容器是去做实际解析工作后，Spring 要做的事就简单了：在你拿到 MultipartFile 对象之前，调用容器解析，把原始请求包一层。
 
-`DispatcherServlet`（Spring MVC 的前端控制器）的 `doDispatch` 一进来就做这一步改造：
+**入口**在 `DispatcherServlet`——Spring MVC 的前端控制器，所有请求都先到它这里，此刻tomcat还没有开始解析文件（这对理解整个处理链路十分关键）。它的 `doDispatch` 一开始就做这一步改造：
 
 ```java
-// org.springframework.web.servlet.DispatcherServlet#doDispatch（6.1.x）
+// org.springframework.web.servlet.DispatcherServlet#doDispatch
 processedRequest = checkMultipart(request);
-multipartRequestParsed = (processedRequest != request);
 ```
 
-`checkMultipart` 只在 `multipartResolver.isMultipart(request)` 为真时，才调用 `resolveMultipart(request)` 把原请求包一层。默认实现 `StandardServletMultipartResolver#resolveMultipart` 的全部工作是：
-
-```java
-return new StandardMultipartHttpServletRequest(request, this.resolveLazily);
-```
-
-而 `StandardMultipartHttpServletRequest#parseRequest` 才去调容器的 `getParts()`，把每个 `Part` 按有没有 `filename` 分成"文件"和"普通参数"：
+`checkMultipart` 只在请求确实是 multipart 时，才让 `MultipartResolver`（Boot 默认给的是 `StandardServletMultipartResolver`）去包装。这个解析器的 `resolveMultipart` 只有一行：`new StandardMultipartHttpServletRequest(request, resolveLazily)`；真正的解析发生在后者的 `parseRequest` 里：
 
 ```java
 // org.springframework.web.multipart.support.StandardMultipartHttpServletRequest#parseRequest
-Collection<Part> parts = request.getParts();          // ← 真正干活的是容器
-for (Part part : parts) {
-    ContentDisposition disposition = ContentDisposition.parse(part.getHeader(HttpHeaders.CONTENT_DISPOSITION));
-    String filename = disposition.getFilename();
-    if (filename != null) {
-        files.add(part.getName(), new StandardMultipartFile(part, filename));
-    } else {
-        this.multipartParameterNames.add(part.getName());
-    }
-}
+Collection<Part> parts = request.getParts();   // ← 真正干活的是容器
+// 逐个 part 看 Content-Disposition：带 filename 的包成 StandardMultipartFile（文件），
+// 不带的记为普通参数
 ```
 
-所以链路是**两层**：Tomcat 读字节、切 part、决定落盘；Spring 把 `Part` 适配成 `MultipartFile`。`MultipartResolver` 决定的是"要不要包、什么时候包、用哪个容器的解析器"。
+所以链路是两层：容器读字节、切 part、决定落盘；Spring 把 `Part` 适配成 `MultipartFile`。
 
-`resolveLazily` 决定了包的时候解不解析：默认 `false`，构造函数里立刻调用 `parseRequest`，即**解析错误在 `checkMultipart` 阶段就抛出**；设成 `true` 就推迟到第一次访问文件或参数时。Boot 把它暴露为 `spring.servlet.multipart.resolve-lazily`，默认 `false`。
+上面那个 `resolveLazily` 对应配置项 `spring.servlet.multipart.resolve-lazily`，默认 `false`，意思是"包的时候立刻解析"——也就是说默认配置下，解析发生在进入 Controller 之前。设成 `true`，解析会推迟到你第一次碰文件或参数时，好处是解析错误晚一点抛。但要记住：它管不了 2.2 里那种由 `getParameter` 引发的解析，容器该读还是会读。
 
-### 2.4 我配的东西，怎么送到容器手里
+### 2.4 配置是怎么到容器手里的：在 servlet 注册那一刻交出去
 
-到这里还剩一个缺口：那个 `MultipartConfigElement` 是从哪来的？为什么我在 `application.yml` 里写一行值，就能管住 Tomcat 的解析？
+回到 2.1 留的缺口：那份 `MultipartConfigElement` 从哪来？
 
-这条链路并不长：**`spring.servlet.multipart.*` → `MultipartProperties#createMultipartConfig()` → 一个 `MultipartConfigElement` bean → Boot 把它挂到 Servlet 的 registration 上 → Tomcat `parseParts` 里的那个 `mce`。**
+链路并不长。`application.yml` 里的 `spring.servlet.multipart.*` 先被 Boot 的 `MultipartProperties` 读走（就在 `spring-boot-autoconfigure` 里），由它生成一个 `MultipartConfigElement` bean；注册 `DispatcherServlet` 时，这个 bean 被交给 servlet 的 registration，容器再把它存到对应 servlet 上。最后取出来的地方，就是 2.1 里那句 `getWrapper().getMultipartConfigElement()`。
+
+三个默认值可以直接看 `MultipartProperties` 的字段：
 
 ```java
 // org.springframework.boot.autoconfigure.web.servlet.MultipartProperties
-private DataSize maxFileSize = DataSize.ofMegabytes(1);       // max-file-size
-private DataSize maxRequestSize = DataSize.ofMegabytes(10);   // max-request-size
-private DataSize fileSizeThreshold = DataSize.ofBytes(0);     // file-size-threshold
+private DataSize maxFileSize = DataSize.ofMegabytes(1);     // max-file-size：单文件 1MB
+private DataSize maxRequestSize = DataSize.ofMegabytes(10); // max-request-size：整份请求 10MB
+private DataSize fileSizeThreshold = DataSize.ofBytes(0);   // file-size-threshold：0
 ```
 
-要点是"交出去的时机"：**限制不在你的 Controller 里生效，也不在 Spring 的解析器里生效，而是在 Servlet 注册那一刻就被交给了容器**。所以想改上传上限只有两条路——改配置，或自己提供一个 `MultipartConfigElement`。在 `MultipartResolver` bean 上设是没用的——Spring 在 `StandardServletMultipartResolver` 的类注释里明说：容器不允许在 `MultipartResolver` 层设置这类东西。
+看到第一个数，开头那个 3MB 的 PDF 为什么直接报错就有答案了：限制不来自你的代码，来自这份在 servlet 注册时就交出去的配置。第三个数先记住，第三章会说它为什么重要。
 
-### 2.5 2.x → 3.x：真正的断点在哪
+这里的要点是"交出去的时机"：这些值不在 Controller 里生效，也不在 Spring 的解析器里生效，而是在 servlet 注册那一刻就被交给了容器。所以想改上传上限只有两条路：改配置，或者自己提供一个 `MultipartConfigElement` bean。
 
-主线讲完了。剩下一段只在升级时才暴露的历史差异——**这里有两处流传很广、但站不住脚的说法**。
+`StandardServletMultipartResolver` 本身只有两个开关：一个是是否懒解析，另一个是 3.2 才加的 `strict-servlet-compliance`（默认 `false`——此时任何 `multipart/` 开头的 Content-Type 都会被当成上传处理，改成 `true` 就只认 `multipart/form-data`）。里面没有任何"上限"的设置项，上限根本不归它管。
 
-**说法一："Boot 2.x 用的是 `CommonsMultipartResolver`（基于 Apache Commons FileUpload 的那个解析器），3.x 才换成 `StandardServletMultipartResolver`。"**
+接下来看第三个问题：解析出来的字节，去了哪里。
 
-对照源码，Boot 2.7.18 与 3.2.x 的 `MultipartAutoConfiguration`（Boot 的自动配置类）里，这个 Bean 的写法只差 3.2.x 多出的最后一行：
+## 三、读出来的字节去了哪：默认配置下每个文件都会落盘
 
-```java
-@Bean(name = DispatcherServlet.MULTIPART_RESOLVER_BEAN_NAME)
-@ConditionalOnMissingBean(MultipartResolver.class)
-public StandardServletMultipartResolver multipartResolver() {
-    StandardServletMultipartResolver multipartResolver = new StandardServletMultipartResolver();
-    multipartResolver.setResolveLazily(this.multipartProperties.isResolveLazily());
-    multipartResolver.setStrictServletCompliance(...);   // ← 3.2 起才有这一行
-    return multipartResolver;
-}
-```
+第二章讲清了"谁在读、什么时候读"，但没讲读完放在哪。这个问题直接决定你的磁盘会不会涨、内存会不会爆，也是"我只传了个几百 KB 的表单，临时目录里怎么多了一堆文件"的答案。
 
-2.x 的默认解析器从来就是 `StandardServletMultipartResolver`。那 `CommonsMultipartResolver` 为什么会出现在 2.7 的自动配置里？因为它出现在另一个方法的条件里：
+### 3.1 一个默认值为 0 的阈值，决定了每个文件都会落盘
 
-```java
-// Boot v2.7.18（3.2.x 已无此行）
-@Bean
-@ConditionalOnMissingBean({ MultipartConfigElement.class, CommonsMultipartResolver.class })
-public MultipartConfigElement multipartConfigElement() { ... }
-```
+你可能以为"小文件留内存、大文件才落盘"是默认行为。不是。决定这件事的阈值，Boot 默认给的是 0。
 
-它的作用是：**当用户自己声明了 `CommonsMultipartResolver` 时，让 `MultipartConfigElement` 退避**——因为 Commons 解析器在应用内自己解析，不需要容器再准备一套 multipart-config。它不是"检测到 classpath 里有 commons-fileupload 就自动切换实现"。
-
-**说法二："3.x 把解析器实现换掉了，所以升级后上传报错。"**
-
-真正的断点在别处，有两条，都能直接查证：
-
-**（1）Spring Framework 6.0 删除了 `CommonsMultipartResolver`。**
-在 5.3.x 里，`spring-web/src/main/java/org/springframework/web/multipart/commons/CommonsMultipartResolver.java` 存在，类声明为 `public class CommonsMultipartResolver extends CommonsFileUploadSupport implements MultipartResolver, ServletContextAware`；到 6.0.0，同一路径不存在了，而且**5.3.x 全程没给它加过 `@Deprecated`**——没有弃用预警，6.0 直接移除。所以"手动声明 `CommonsMultipartResolver`"这条路在 Framework 6.0 / Boot 3.0 就断了——项目会直接编译或启动失败，而不是"行为悄悄变了"。这也正好解释了为什么 Boot 2.7 的 `multipartConfigElement()` 条件里要额外放一个 `CommonsMultipartResolver.class`：给那条即将消失的路让位。
-
-**（2）Boot 2.0 把配置前缀从 `spring.http.multipart` 改成了 `spring.servlet.multipart`。**
-Boot 1.5 的 `MultipartProperties` 上写的是 `@ConfigurationProperties(prefix = "spring.http.multipart")`，Boot 2.0 起改为 `spring.servlet.multipart` 并沿用至今。从 1.x 升上来的老项目，如果配置项还写在旧前缀下，它会被**静默忽略**——不报错，只是限制没生效。这是"升级后上传行为变了"最常见的原因。
-
-还有一处更晚的差异：3.2.x 的 `MultipartProperties` 多了 `strict-servlet-compliance`（默认 `false`，2.7.18 无）：它为 `false` 时任何 `multipart/` 开头的 Content-Type 都会被包装，为 `true` 时只认 `multipart/form-data`。
-
-小结一下这一章：**容器解析，Spring 包装**；触发点是 `checkMultipart` 或任意一次 `getParameter`；2.x→3.x 的真实断点是"前缀改名"和"Commons 解析器被删"，而不是"默认实现换了"。
-
-接下来看第三个问题：解析出来的字节，到底去了哪里。
-
-
-## 三、字节去了哪：默认配置下每个文件都会落盘
-
-上一章说清的是"限制由容器执行"，但没说字节**具体躺在哪**。这条线画在哪、临时文件活多久，直接决定你的磁盘和内存该怎么配。
-
-### 3.1 判断"内存还是磁盘"的那一行代码
-
-Tomcat 把 `MultipartConfigElement` 里的三个值原样转交给 Commons FileUpload 的重新打包版本（注意包名是 `org.apache.tomcat.util.http.fileupload`，不是 `org.apache.commons.fileupload`）：
+Tomcat 把配置里的值原样转交给它自带的一个上传库。这个库是 Commons FileUpload 在 Tomcat 里的重新打包版本，包名是 `org.apache.tomcat.util.http.fileupload`，不是 `org.apache.commons.fileupload`——它和 Spring 自己那个 `CommonsMultipartResolver`（应用内自己解析的那条老路）不是一回事：前者是容器内部真正干活的解析库，后者是 Spring 提供的一条可选实现。
 
 ```java
 // org.apache.catalina.connector.Request#parseParts
 DiskFileItemFactory factory = new DiskFileItemFactory();
 factory.setRepository(location.getCanonicalFile());   // 临时目录
-factory.setSizeThreshold(mce.getFileSizeThreshold()); // ← 阈值
-
-FileUpload upload = new FileUpload();
-upload.setFileItemFactory(factory);
-upload.setFileSizeMax(mce.getMaxFileSize());     // max-file-size
-upload.setSizeMax(mce.getMaxRequestSize());      // max-request-size
+factory.setSizeThreshold(mce.getFileSizeThreshold()); // ← 阈值，Boot 默认 0
 ```
 
-在每个 part 对应的 `DiskFileItem` 里，真正的决策者是 `DeferredFileOutputStream`，而负责做阈值判断的是它的父类：
+每个 part 在解析时都会变成一份"文件项"（`DiskFileItem`），它背后是一个"先写内存、超过阈值就改写磁盘"的输出流。做这个切换判断的，是这个输出流的父类：
 
 ```java
 // org.apache.tomcat.util.http.fileupload.ThresholdingOutputStream
-public boolean isThresholdExceeded() {
-    return written > threshold;                       // 注意是严格大于
-}
-
 protected void checkThreshold(final int count) throws IOException {
     if (!thresholdExceeded && written + count > threshold) {
         thresholdExceeded = true;
-        thresholdReached();                           // 切到磁盘输出流
+        thresholdReached();     // 从这里开始，后续内容写进临时文件
     }
 }
 ```
 
-现在代入 Boot 的默认值 `file-size-threshold: 0`：只要解析器写出**第一个字节**（`written + count > 0` 必真），`thresholdReached()` 就会被调用，`DeferredFileOutputStream` 随即创建临时文件并把后续内容全部写盘。
+代入默认值 0：写出第一个字节时 `written + count > 0` 就成立，于是立刻切到磁盘。**默认配置下，每个 part 都会先落成临时文件——文件字段和普通文本字段都一样，与大小无关。**这不是 bug，是阈值 0 的直接后果；把 `file-size-threshold` 配成大于 0 的值，才会出现"小的留内存、大的才落盘"的分层。
 
-**结论：默认配置下，上传的每一个文件都会落到磁盘的临时文件里，与文件大小无关。** 这不是 bug，是阈值 0 的直接后果。`file-size-threshold` 配成一个大于 0 的值，才会出现"小文件留在内存、大文件才落盘"的分层。
+### 3.2 临时文件落在 work 目录下，名字是 upload_*.tmp
 
-### 3.2 临时文件叫什么、在哪
-
-临时目录的选取也在 `parseParts` 里：
+要清磁盘、要排查"文件残留在哪"，第一个问题就是路径。临时目录的选择也在 `parseParts` 里：
 
 ```java
+// org.apache.catalina.connector.Request#parseParts
 String locationStr = mce.getLocation();
 if (locationStr == null || locationStr.length() == 0) {
     location = (File) context.getServletContext().getAttribute(ServletContext.TEMPDIR);
 } else {
-    location = new File(locationStr);                 // 相对路径 → 相对 TEMPDIR
+    location = new File(locationStr);
     if (!location.isAbsolute()) {
-        location = new File((File) context.getServletContext().getAttribute(ServletContext.TEMPDIR),
-                locationStr).getAbsoluteFile();
+        location = new File(TEMPDIR, locationStr).getAbsoluteFile();  // 相对路径 → 相对 TEMPDIR
     }
 }
-if (!location.exists() && context.getCreateUploadTargets()) { location.mkdirs(); }
-if (!location.isDirectory()) {
-    partsParseException = new IOException(sm.getString("coyoteRequest.uploadLocationInvalid", location));
-    return;
-}
 ```
 
-要点：`spring.servlet.multipart.location` 为空时用容器的 `TEMPDIR`；配相对路径时也是相对 `TEMPDIR` 解析；目录不存在且允许创建时会 `mkdirs()`。**`location` 配错（比如指向一个不存在的、又不允许自动创建的目录）的失败点就在这里**，表现是 `IOException`，不是"上传不能用"。
+`spring.servlet.multipart.location` 没配时，用的是容器的临时目录 `ServletContext.TEMPDIR`。这个目录在 Tomcat 里就是它的 `work` 目录；用内嵌 Tomcat 时，Boot 默认把它建在系统临时目录（`java.io.tmpdir`）下的一个 `tomcat.*` 目录里，所以你在 `/tmp/tomcat.xxxx/work/...` 下面看到上传文件，是正常的。配了相对路径，也是相对这个临时目录解析，不是相对进程的工作目录。目录不存在且允许创建时会自动建，建不出来则是 `IOException`。
 
-文件名由 `DiskFileItem#getTempFile` 生成：
+文件名由 `DiskFileItem` 生成，格式是 `upload_<一串随机字符>_<自增序号>.tmp`。所以临时目录里那一排排 `upload_*.tmp`，就是它们。
 
-```java
-final String tempFileName = String.format("upload_%s_%s.tmp", UID, getUniqueId());
-tempFile = new File(tempDir, tempFileName);
-```
+### 3.3 拿到 MultipartFile 时，内容默认已经在磁盘上
 
-`UID` 是类初始化时的 `UUID.randomUUID().toString().replace('-', '_')`，`getUniqueId()` 是一个进程内自增计数器。所以你在临时目录里看到的一堆 `upload_*.tmp`，就是它们。
+这个问题在代码里看不出来，但它决定了你后面每一步的内存代价。
 
-### 3.3 `MultipartFile` 是什么：`Part` 的一层适配
+Spring 的 `StandardMultipartFile`（它是 `StandardMultipartHttpServletRequest` 里的内部类）只是 `Part` 的一层薄包装：`getSize()` 转给 `part.getSize()`，`getBytes()` 转给 `copyToByteArray(part.getInputStream())`，`transferTo(File)` 转给 `part.write(...)`。它不暴露"内容是在内存还是磁盘"，只给你两类入口：一类是流（`getInputStream()`），一类是"我要一份完整内容"（`getBytes()` / `transferTo()`）。
 
-Spring 侧的 `StandardMultipartFile` 是 `Part` 的薄包装：`getSize()` → `part.getSize()`、`getBytes()` → `FileCopyUtils.copyToByteArray(part.getInputStream())`、`transferTo(File)` → `part.write(dest.getPath())`。
+按 3.1 的结论，默认配置下你拿到它的时候，内容已经在磁盘上了。
 
-注意 `MultipartFile` **本身不暴露"内容在内存还是磁盘"**。它只有 `getInputStream()` 这类流式入口，以及 `getBytes()` / `transferTo()` 这两类"我要一份完整内容"的入口。
+### 3.4 把阈值调大：小的留内存，大的才落盘
 
-### 3.4 阈值配置 ↔ 实际落点：速查表
-
-| `file-size-threshold` | 传一个 1KB 的文件 | 传一个 100MB 的文件 | 堆内存代价 |
+| `file-size-threshold` | 1KB 的文件 | 100MB 的文件 | 堆内存代价 |
 |---|---|---|---|
-| `0`（Boot 默认） | 解析时就写进 `location` 下的 `upload_*.tmp` | 同上，边读边写 | 几乎不占堆，但每个文件都留下一个临时文件 |
-| `2MB` | 全部留在堆内存（`DeferredFileOutputStream` 的字节数组） | 越过 2MB 后切到磁盘，已缓冲的 2MB 也一并写入该文件 | 阈值以下的内容全在堆上；并发上传时是主要风险 |
-| `10KB` | 同样留在内存（1KB 没到 10KB） | 越过 10KB 后切到磁盘 | 堆上最多只驻留阈值大小的内容 |
+| `0`（Boot 默认） | 解析时就写进 `upload_*.tmp` | 同上，边读边写 | 几乎不占堆，但每个文件都留一个临时文件 |
+| `2MB` | 留在堆内存 | 越过 2MB 后切到磁盘，已缓冲的 2MB 一起写进去 | 阈值以下的内容全在堆上，并发上传时是主要风险 |
+| `10KB` | 留在内存 | 越过 10KB 后切到磁盘 | 堆上最多驻留阈值大小的内容 |
 
-判断"越过"的那一行在 `ThresholdingOutputStream#checkThreshold`：`written + count > threshold`。阈值越小，落盘越早。
+判断"越过"的那一行就是 `written + count > threshold`：阈值越小，落盘越早。另外两个上限 `max-file-size` / `max-request-size` 与落点无关，它们决定的是"读到多少字节时抛异常"，那是下一篇的主题。
 
-`max-file-size` / `max-request-size` 与落点无关，它们决定的是"读到多少字节时抛异常"——这是下一篇的主题。
+### 3.5 transferTo 和 getBytes：两种完全不同的内存代价
 
-### 3.5 `transferTo` 与 `getBytes`：两种内存代价
-
-先看那段决定代价的代码——它只有十几行，却解释了后面两种截然不同的开销：
+先看那段决定代价的代码，它只有十几行：
 
 ```java
-// org.apache.tomcat.util.http.fileupload.disk.DiskFileItem#write
+// org.apache.tomcat.util.http.fileupload.disk.DiskFileItem#write（节选）
 public void write(final File file) throws Exception {
     if (isInMemory()) {
         try (OutputStream fout = Files.newOutputStream(file.toPath())) {
-            fout.write(get());                    // 内存 → 目标文件：拷一次
+            fout.write(get());                   // 内存 → 目标文件：整份拷一次
         }
     } else {
         final File outputFile = getStoreLocation();
         size = outputFile.length();
         if (file.exists() && !file.delete()) { throw new FileUploadException(...); }
-        if (!outputFile.renameTo(file)) {          // ← 同文件系统：改名即成，O(1)
-            // 跨文件系统：退化成 BufferedInputStream → BufferedOutputStream 的流复制
+        if (!outputFile.renameTo(file)) {        // ← 同文件系统：改名即成，几乎零成本
+            // 跨文件系统：renameTo 失败，退化成输入流到输出流的复制
         }
     }
 }
 ```
 
-- **`transferTo(dest)`**：内容在磁盘上且 `dest` 与临时目录**在同一个文件系统**时走 `renameTo`，几乎零成本；跨文件系统（比如临时目录在容器可写层、`dest` 挂在另一个卷上）就退化成整份拷贝。内容在内存时必然是一次完整写出。
-- **`getBytes()`**：把整份内容读进**堆内存**，返回一个 `byte[]`。`StandardMultipartFile#getBytes` 的实现是 `copyToByteArray(part.getInputStream())`，无论内容原本在哪，**这一次一定占堆**。并发上传时，这是最容易被忽略的内存放大点。
+于是两条路的代价完全不同。`transferTo(dest)` 在内容已落盘、且 `dest` 与临时目录在同一个文件系统时走 `renameTo`，几乎零成本；跨文件系统（比如临时目录在容器可写层、`dest` 挂在另一个卷上）就退化成整份拷贝。`getBytes()` 则是把整份内容读进堆内存，无论它原本在哪，这一次一定占堆——并发上传时，这是最容易被忽略的内存放大点。
 
-再补两个容易踩的边界：`DiskFileItem#write` 只在第一次调用时可靠——如果它走了 `renameTo`，临时文件已经不在原处了；`part.write()` 也不保证支持绝对路径（Spring 在 `transferTo` 里对"传了绝对路径但目标没出现"的情况做了兜底复制）。
+同一个 `transferTo`，接收 `File` 和接收 `Path` 走的也不是同一条路：`File` 版本交给容器的 `Part#write`（同卷时就是上面这个 `renameTo`），`Path` 版本在 Spring 里就是一次流复制，临时文件不会因此消失。
 
-### 3.6 谁创建、谁删除、什么时机删
+### 3.6 谁创建、谁删除：临时文件的寿命是一次请求
 
-**创建**：解析过程中，`DeferredFileOutputStream` 越过阈值时由 `DiskFileItem#getTempFile` 生成。
+创建发生在解析过程中，越过阈值时由 `DiskFileItem` 生成。删除则有三条独立的路径，分清哪条生效很重要——它决定了"我把文件转移到业务目录了，临时文件还在不在"。
 
-**删除**有三条独立路径，看清哪条生效很重要：
+第一条，解析失败时，真正读字节的那一层（Tomcat 打包进来的 `FileUploadBase#parseRequest`）会在自己的 `finally` 里清理：既然已经知道这次上传失败了，就把已经产出的临时文件逐个删掉。
 
-**（1）解析失败时——`parseParts` 自己在 finally 里清。** Tomcat 10.1.x 的实现里，解析过程中若 `success` 仍为 `false`，会遍历已产出的 `FileItem` 逐个 `delete()`。代码给的理由是：临时副本本可由 GC 兜底，但既然已经知道上传失败，就在这里显式清掉。
-
-**（2）请求结束时——`Request#recycle` 兜底。** Tomcat 回收请求对象时逐个删：
+第二条，请求结束时，Tomcat 回收请求对象时兜底。请求处理完，`Request` 会走到 `recycle`：
 
 ```java
-// org.apache.catalina.connector.Request#recycle
+// org.apache.catalina.connector.Request#recycle（每次 delete 都 try/catch，失败只记 warn 日志）
 if (parts != null) {
-    for (Part part : parts) {
-        try { part.delete(); } catch (Throwable t) { log.warn(...); }
-    }
+    for (Part part : parts) { part.delete(); }
     parts = null;
 }
 ```
 
-**（3）响应写完后——Spring 主动清。** `DispatcherServlet#doDispatch` 的 `finally`：
+第三条，Spring 在响应写完后的收尾里再删一次。`DispatcherServlet#doDispatch` 的 `finally` 会在这次请求是 multipart 时调用 `cleanupMultipart`，最终落到 `StandardServletMultipartResolver#cleanupMultipart`，逐个 `part.delete()`（基线 6.1.15 里删的是全部 part；6.1.14 及以前只删带文件名的 part，那是给 Resin 留的兼容写法）。
 
-```java
-if (multipartRequestParsed || asyncManager.isMultipartRequestParsed()) {
-    cleanupMultipart(processedRequest);
-}
-```
+于是可以记住一句话：**临时文件的默认寿命是一次请求，不是"你 `transferTo` 之后就删"。**你把文件搬到业务目录，内容是被复制或改名走了，临时文件本身仍然活到请求结束（同卷 `renameTo` 的情况除外）。异常路径也有清理，真正会残留的是进程被强杀、或者外层没有正常收尾的情况。
 
-最终落到 `StandardServletMultipartResolver#cleanupMultipart`：
+想让磁盘上少出现临时文件，唯一的手段是在落盘之前就用足够大的 `file-size-threshold` 把内容留在内存（前提是内容真的小）；至于临时文件的删除时机，你控制不了。
 
-```java
-for (Part part : request.getParts()) {
-    part.delete();   // 6.1.15 起删全部 part（6.1.14 及以前只删文件 part）
-}
-```
+到这里，`MultipartFile` 的内容在哪、怎么删、什么时候消失，都说清了。接下来把这条链串成一次完整的旅程，再回答开头那两个接口。
 
-所以要记住的判断是：
+## 四、收口：一个上传请求的完整旅程
 
-- **临时文件的默认寿命 = 一次请求**，不是"你 `transferTo` 之后就删"。你把文件搬到业务目录，是"内容被复制/改名走了"，临时文件仍然活到请求结束（`renameTo` 的情况除外）。
-- **异常路径也有清理**：解析失败走（1），请求正常收尾走（2）（3）。真正会残留的，是进程被强杀、或者 GC 迟迟不回收时的兜底文件。
-- 想让临时文件更早消失，只有一条正路：在放盘之前就用足够大的 `file-size-threshold` 把内容留在内存（前提是它真的小）。
-
-`MultipartFile` 的内容在哪、怎么删，到此都清楚了。但同一份上传请求，如果跑在 WebFlux 上，上面这套结论会整体失效。
-
-
-## 四、WebFlux 下是完全不同的模型
-
-### 4.1 没有 `Part`，只有 `FilePart` 和流
-
-前三章讲的都是 Servlet 容器那一套：`Part`、临时目录、`MultipartConfigElement`——**这套东西在 WebFlux 上整体不存在**，而那份 `application.yml` 在这里一个字都不生效。那它靠什么收字节？
-
-WebFlux 的 `HttpMessageReader` 把 body 解析成 `Flux<Part>`（`Flux` 是 Reactor 的流，代表 0 到 N 个元素）：文件部分是 `FilePart`，普通字段是 `FormFieldPart`。要边收边处理（比如边写对象存储），还有 6.0 引入的 `PartEvent`，它把 part 拆成"头部事件 + 内容事件 + 结束事件"，内容以 `DataBuffer`（Spring 的字节缓冲）逐块下发。
-
-**关键差别是背压（backpressure）**：MVC 侧 `Part` 一旦解析完，内容就已经完整躺在内存或磁盘上，你什么时候读是你的事；WebFlux 侧 `FilePart#content()` 是一个 `Flux<DataBuffer>`，你不 `subscribe`，数据就不会被继续读进来。这是两种模型的根本分歧。
-
-### 4.2 "默认不落盘"是个需要修正的说法
-
-一个流传的说法是"WebFlux 的 multipart 默认不落盘"。看默认值，这个说法不准确：
-
-```java
-// org.springframework.http.codec.multipart.DefaultPartHttpMessageReader（6.1.x）
-private int maxInMemorySize = 256 * 1024;    // 每个 part 的内存上限
-private int maxHeadersSize = 10 * 1024;
-private long maxDiskUsagePerPart = -1;
-private int maxParts = -1;
-private FileStorage fileStorage = FileStorage.tempDirectory(this::getBlockingOperationScheduler);
-```
-
-这个 reader 的类注释把行为写得很清楚：**超过 `maxInMemorySize` 的 part 会被写进 `fileStorageDirectory` 下的临时文件**。而 `FileStorage.TempFileStorage#tempDirectory` 的实现是 `Files.createTempDirectory("spring-multipart-")`——也就是系统临时目录下一个以 `spring-multipart-` 为前缀的随机目录。
-
-所以准确的表述是：**WebFlux 默认也有"内存阈值 + 落盘"的分层，阈值 256KB；只有走 `PartEvent` 流式处理时，文件内容才不会被缓存到临时文件**（Boot 的 `spring.webflux.multipart.file-storage-directory` 在 javadoc 里注明了这一点）。
-
-### 4.3 限额对应哪些配置项
-
-Boot 把这两个 multipart 消息读取器（`DefaultPartHttpMessageReader` 与 `PartEventHttpMessageReader`）的参数接到了同一个前缀上。`ReactiveMultipartProperties` 的注解是 `@ConfigurationProperties(prefix = "spring.webflux.multipart")`，字段与默认值如下：
-
-| 配置项 | `ReactiveMultipartProperties` 默认值 | 落到 reader 的哪个 setter |
-|---|---|---|
-| `spring.webflux.multipart.max-in-memory-size` | `256KB` | `setMaxInMemorySize` |
-| `spring.webflux.multipart.max-headers-size` | `10KB` | `setMaxHeadersSize` |
-| `spring.webflux.multipart.max-disk-usage-per-part` | `-1`（不限） | `DefaultPartHttpMessageReader#setMaxDiskUsagePerPart` / `PartEventHttpMessageReader#setMaxPartSize` |
-| `spring.webflux.multipart.max-parts` | `-1`（不限） | `setMaxParts` |
-| `spring.webflux.multipart.file-storage-directory` | 空 → 用 `Files.createTempDirectory("spring-multipart-")` | `setFileStorageDirectory`（`PartEventHttpMessageReader` 无此项） |
-| `spring.webflux.multipart.headers-charset` | `UTF-8` | `setHeadersCharset` |
-
-注意最后两列：Boot 的自动配置类 `ReactiveMultipartAutoConfiguration` 用一个 `CodecCustomizer`（定制编解码器的回调）把这些值按 reader 类型分流，所以**同一个 `max-disk-usage-per-part` 在两个 reader 上落到不同的 setter**。
-
-另外，`spring.codec.max-in-memory-size` 是**另一个东西**：它管的是"输入流需要聚合时可缓冲的字节上限"，作用于自动配置的编解码器整体，默认未设置（多数 codec 自己的默认值是 256K），与"part 落不落盘"无关。把这两个键混为一谈，是 WebFlux 上传调参时最常见的误判。（Boot 3.5 起该前缀已弃用，改用 `spring.http.codecs.*`，计划 4.0.0 移除。）
-
-### 4.4 与 MVC 的对比
-
-| 维度 | Spring MVC（Boot 3 / Tomcat 10.1） | Spring WebFlux |
-|---|---|---|
-| 解析者 | 容器（Tomcat `Request#parseParts`） | 框架（`DefaultPartHttpMessageReader`） |
-| 编程模型 | `MultipartFile`（同步、阻塞） | `FilePart` / `Flux<Part>` / `PartEvent` |
-| 内存阈值配置 | `spring.servlet.multipart.file-size-threshold`（默认 0） | `spring.webflux.multipart.max-in-memory-size`（默认 256KB） |
-| 阈值以下的内容在 | 内存（但默认阈值为 0，实际总是落盘） | 内存 |
-| 阈值以上的内容 | 磁盘临时文件（`location`） | 临时文件（`spring-multipart-*` 目录，可配） |
-| 临时文件何时删 | 请求结束时由 Spring / Tomcat 清理 | 由 `Part#delete()` 或上层释放触发；part 尚未交出时随订阅 dispose 删除 |
-| 背压 | 无（`Part` 已是完整结果） | 有（`Flux<DataBuffer>`） |
-| 适合的场景 | 常规表单上传、文件落业务目录 | 大文件直传、边收边转、高并发低内存 |
-
-一句话收口：**MVC 把复杂度交给了容器和临时文件，WebFlux 把复杂度交给了数据流和背压。**
-
-
-## 五、收口：一个上传请求的完整旅程
-
-把这一篇的结论串成一条线。下文涉及的两条基线是：**Boot 3.2.x（Spring Framework 6.1.15、Tomcat 10.1.33）**与对照用的 **Boot 2.7.18（Spring Framework 5.3.31、Tomcat 9.0.83）**。默认配置下一次 `multipart/form-data` 上传的路径是：
+把这一篇的结论串成一条线。基线是 Boot 3.2.x（Spring Framework 6.1.15、Tomcat 10.1.33），默认配置下一次 `multipart/form-data` 上传走的是：
 
 ```text
 客户端
   │  POST /upload  Content-Type: multipart/form-data; boundary=...（body 里混排文本字段与二进制文件）
   ▼
-Nginx / 网关
-  │  可先用 client_max_body_size 拒绝，或把 body 转发给后端（缓冲细节见第二篇）
-  ▼
 Tomcat（工作线程，来自线程池）
-  │  CoyoteAdapter → ApplicationFilterChain → DispatcherServlet
+  │  CoyoteAdapter（把连接器收到的请求送进容器的处理管线）→ Filter 链 → DispatcherServlet
   ▼
 DispatcherServlet#doDispatch
   ├─ checkMultipart(request)
   │    └─ StandardServletMultipartResolver#resolveMultipart
   │         └─ new StandardMultipartHttpServletRequest(request, false)
   │              └─ parseRequest → request.getParts()
-  │                   └─ Tomcat Request#parseParts(true)   ← 真正的字节解析在这里
+  │                   └─ Tomcat Request#parseParts(true)   ← 真正读字节的地方
   │                        ├─ 取 servlet 上的 MultipartConfigElement（来自 spring.servlet.multipart.*）
   │                        ├─ 临时目录 = location ?: ServletContext.TEMPDIR
-  │                        ├─ DiskFileItemFactory.setSizeThreshold(0)  → 第一个字节就落盘
-  │                        ├─ FileUpload.parseRequest(...) 边读边切 part
-  │                        └─ 每个文件 part → ApplicationPart(包装 DiskFileItem) → upload_*.tmp
-  ├─ getHandler / HandlerAdapter / 参数解析
-  │    └─ MultipartFile 参数拿到的是那个 Part 的薄包装（内容在临时文件里）
+  │                        ├─ DiskFileItemFactory.setSizeThreshold(0) → 第一个字节就落盘
+  │                        ├─ 边读 body 边切 part
+  │                        └─ 每个文件 part → ApplicationPart（Tomcat 对文件项的 Part 包装）→ upload_*.tmp
+  ├─ 找 handler、执行参数解析
   ├─ Controller 方法执行
   │    └─ transferTo / getBytes / 读 InputStream
   └─ finally → cleanupMultipart → StandardServletMultipartResolver#cleanupMultipart
        └─ part.delete()   临时文件在这里消失
 ```
 
-回过头看开头那两个接口，答案已经落地，而且关键在于**它们根本不是同一条链路**。3MB 的 PDF 走 MVC：限制不来自你的代码，而来自 `spring.servlet.multipart.*` 映射出的 `MultipartConfigElement`，再被 Tomcat 在解析途中触发——`max-file-size` 默认 1MB，3MB 必然过不去。200MB 的视频走 WebFlux：那条链路上没有 `MultipartConfigElement`，也没有 MVC 的 `max-file-size`；`DefaultPartHttpMessageReader` 只按 `spring.webflux.multipart.max-in-memory-size`（默认 256KB）决定"留在内存还是写临时文件"，而磁盘上限 `max-disk-usage-per-part` 默认 `-1`，即不设限。**同一份 `application.yml`，两个前缀管两套完全不同的机制**——这才是"同项目、两种表现"的真相。
+回过头看开头那两个接口，答案并不在同一条链路上。
 
-下一篇接着往下走：`max-file-size` 与 `max-request-size` 到底在第几个字节被触发、抛出的是哪个异常、为什么有的场景客户端看到的是连接被断开；以及当下最常用的做法——**不落盘直传**（`PartEvent` 边收边转、预签名 URL 直传对象存储）该怎么选、各自的边界在哪。
+3MB 的 PDF 走 MVC：限制不来自你的代码，而来自 `spring.servlet.multipart.*` 映射出的 `MultipartConfigElement`，再被 Tomcat 在解析途中触发——`max-file-size` 默认 1MB，3MB 必然过不去。
+
+200MB 的视频走的是另一条链路：WebFlux。那里没有 `Part`、没有 `MultipartConfigElement`，也就没有这个 1MB 上限；限额换到 `spring.webflux.multipart` 前缀下，内存阈值默认 256KB、磁盘默认不限，收字节靠的是流和背压，而不是容器的临时文件。同一份 `application.yml`，两个前缀管两套完全不同的机制——这才是"同项目、两种表现"的真相。这条链路的模型（`Flux`、背压、订阅）在[深入理解 Spring WebFlux 与 Reactor Netty](/2026/09/15/深入理解-Spring-WebFlux-与-Reactor-Netty/) 里讲过，这里不重复。
+
+下一篇接着往下走：`max-file-size` 与 `max-request-size` 到底在第几个字节被触发、抛出的是哪个异常、为什么有的场景客户端看到的是连接被断开；以及当下最常用的做法——不落盘直传（把 part 的流直接交给对象存储、预签名 URL 直传）该怎么选、各自的边界在哪。
 
 
 ## 延伸阅读

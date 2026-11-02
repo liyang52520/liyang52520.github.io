@@ -20,9 +20,9 @@ categories:
 
 这篇接着 [（一）：从报文到临时文件](/2026/10/23/Spring-文件上传全链路深度解析（一）：从报文到临时文件/) 往下走。第一篇讲报文怎么被解析、`MultipartFile` 从哪里来；这一篇只关心一件事：**这套机制在真实系统里以什么方式失败，以及怎么绕开它。** 口径是 Spring Boot 3.2+ / Spring Framework 6.1 / Tomcat 10.1，2.x 与 3.0/3.1 的差异单独标注。数据路径的架构选择可以和姊妹篇 [Spring 文件下载全方案深度解析](/2026/09/15/Spring-文件下载全方案深度解析/) 的「五、架构层」对着看：下载是把数据踢出应用进程，上传是把数据挡在应用进程之外，方向相反，取舍同源。
 
-## 六、四道限额，四种失败表现
+## 五、四道限额，四种失败表现
 
-### 6.1 全链路图
+### 5.1 全链路图
 
 先建立全局地图，后面每节只拆一层。
 
@@ -43,7 +43,7 @@ DispatcherServlet ──► ④ maxSwallowSize  默认 2 MiB  拦在连接层，
 
 最反直觉的一点：**越靠外的限制，越容易让客户端拿不到一个像样的响应。**
 
-### 6.2 第一道：Nginx 的 `client_max_body_size`
+### 5.2 第一道：Nginx 的 `client_max_body_size`
 
 四道限额里最外面的一道，由 Nginx 自己说话。
 
@@ -57,7 +57,7 @@ location /api/upload {
 
 超限时 Nginx 自己返回 `413 Request Entity Too Large`，**请求根本不会到后端**。文档还提醒：浏览器没法正确显示这个错误——这正是后面要把它改写成 JSON 的原因。
 
-### 6.3 第二道：Tomcat Connector 的几个数
+### 5.3 第二道：Tomcat Connector 的几个数
 
 | 属性 | 默认值 | 限制的是什么 |
 |:---|:---|:---|
@@ -109,7 +109,7 @@ factory.addConnectorCustomizers(connector -> {
 
 调大前先算账。Tomcat 文档的内存估算公式是 `maxPartHeaderSize × maxPartCount × maxConnections × 2`——按默认值：`512 × 50 × 8192 × 2`，约 **400 MB**。这是文档明确提示的 DoS 面。
 
-### 6.4 第三道：Spring 的 multipart 配置
+### 5.4 第三道：Spring 的 multipart 配置
 
 真正会送进 Tomcat 解析器的就是这几项：
 
@@ -134,7 +134,7 @@ upload.setSizeMax(mce.getMaxRequestSize());    // → max-request-size
 
 `StandardServletMultipartResolver` 的类注释里有一句关键的话：**这些设置在 Servlet 容器层面被应用，容器不允许从 `MultipartResolver` 层面去改。** 所以别指望用 `MultipartResolver` bean 设上限——Boot 已经把这些值落到 servlet 注册的 `MultipartConfigElement` 上了。
 
-### 6.5 第四道：`maxSwallowSize`——没有状态码的那一道
+### 5.5 第四道：`maxSwallowSize`——没有状态码的那一道
 
 前三道至少发生在 HTTP 语义之内。第四道不是。
 
@@ -224,7 +224,7 @@ try {
 
 还有一个容易误读的细节：`isError` 变 true 之后，`service()` 里会执行 `response.setStatus(500)`。但响应早就 commit 了，改不动报文，只能让**访问日志和统计里出现一个 500**。于是三方各说各话：前端说连接重置，访问日志说 500，应用日志什么都没有。
 
-### 6.6 四种失败表现对照
+### 5.6 四种失败表现对照
 
 | 拦在哪一层 | 触发条件 | 状态码 | 客户端看到什么 | 后端日志 |
 |:---|:---|:---|:---|:---|
@@ -236,11 +236,11 @@ try {
 
 一句话总结：**只要失败发生在"应用已经拒绝，但请求体还在路上"这个时间窗里，你能拿到的诊断信息几乎为零。**
 
-## 七、为什么 `@ExceptionHandler` 接不住
+## 六、为什么 `@ExceptionHandler` 接不住
 
 `@ExceptionHandler` 是 Spring MVC 里"在一个 handler 类（Controller 或全局 advice）上声明「我来处理这个异常」"的那套机制。先给结论：它大多数时候能接住——接不住的是另外几种情况。要分清，得先知道异常在哪里、以什么类型、在哪个时机抛出来。
 
-### 7.1 原始形态：不是 Spring 的异常
+### 6.1 原始形态：不是 Spring 的异常
 
 解析发生在 Tomcat 内嵌的 fileupload 里，size 超限至少有这么几处抛点：
 
@@ -269,7 +269,7 @@ FileUploadException
 
 `FileCountLimitExceededException`（part 个数超限）直接继承 `FileUploadException`，不在 `SizeException` 之下——这个差别后面会用上。
 
-### 7.2 一路被包成 `IllegalStateException`，再被 Spring"猜"出来
+### 6.2 一路被包成 `IllegalStateException`，再被 Spring"猜"出来
 
 7.1 里那层 `FileUploadIOException` 会在这里先被拆掉：
 
@@ -322,7 +322,7 @@ protected void handleParseFailure(Throwable ex) {
 
 所以 advice 至少要留两条：一条 `MaxUploadSizeExceededException`，一条兜底的 `MultipartException`。
 
-### 7.3 时机：`checkMultipart` 跑在 `getHandler` 之前
+### 6.3 时机：`checkMultipart` 跑在 `getHandler` 之前
 
 先看这段顺序——后面所有"接不住"都由它决定。
 
@@ -358,7 +358,7 @@ for (Map.Entry<ControllerAdviceBean, ExceptionHandlerMethodResolver> entry : thi
 
 还有一个开关能解释这种"行为不一致"：把 `resolve-lazily` 设成 `true`，解析推迟到参数解析阶段，那时 `handlerMethod` 已经有值，Controller 里的局部处理器就能生效了。同一个异常，换个配置换条路径。
 
-### 7.4 没人接也不会是 500（Spring 6.1 / Boot 3.2 起）
+### 6.4 没人接也不会是 500（Spring 6.1 / Boot 3.2 起）
 
 `MaxUploadSizeExceededException` **从 Spring 6.1 起**实现了 `ErrorResponse`（6.0.x 及更早没有）：
 
@@ -392,7 +392,7 @@ if (!response.isCommitted()) {
 
 补一个保守限定：上面说的是默认配置。如果显式打开了 `spring.mvc.problemdetails.enabled`（Boot 里该属性默认 `false`），兜底者会变成 `ProblemDetailsExceptionHandler`，响应体形态不同——**但状态码仍是 413**。
 
-### 7.5 真正接不住的四类
+### 6.5 真正接不住的四类
 
 | 情况 | 为什么接不住 |
 |:---|:---|
@@ -403,9 +403,9 @@ if (!response.isCommitted()) {
 
 第一类里有个容易踩的组合：`MultipartFilter` 在 DispatcherServlet **之前**解析 multipart，异常发生在 filter 里，`@ControllerAdvice` 完全看不到。
 
-## 八、把「失败」变成可诊断的响应
+## 七、把「失败」变成可诊断的响应
 
-### 8.1 全局 advice：让每次拒绝都留痕
+### 7.1 全局 advice：让每次拒绝都留痕
 
 这份处理器只有三个方法，却正好补上 7.2 留下的两个缺口。
 
@@ -443,7 +443,7 @@ public class UploadExceptionAdvice {
 
 三个要点都是前面推理的直接后果：**必须放全局**（7.3）；**必须留 `MultipartException` 兜底**（7.2 的消息匹配不可靠）；**不要把 `-1` 当前上限**（7.2）。
 
-### 8.2 解析之前先看一眼 `Content-Length`
+### 7.2 解析之前先看一眼 `Content-Length`
 
 Tomcat 自己已有 `Content-Length` 预检（7.1），所以这一层的价值不在"更快拒绝"，而在两点：**网关没拦住时给出一致的 JSON**，以及**完全绕开 multipart 解析器的初始化与 part 缓冲**。
 
@@ -463,7 +463,7 @@ protected void doFilterInternal(HttpServletRequest request, HttpServletResponse 
 
 边界必须说清：`Content-Length` 是**声明值**，可以伪造，也可以缺席——chunked 编码的请求就没有它，`getContentLengthLong()` 返回 -1，这个 guard 直接放行。所以它是"快速失败"的优化，**不是限额**；真正的限额仍是 6.5 那几道。
 
-### 8.3 网关层也要给 JSON
+### 7.3 网关层也要给 JSON
 
 Nginx 产生的 413 和后端产生的 413 形态不一致，前端就得写两套解析。统一它：
 
@@ -482,7 +482,7 @@ location /api/upload {
 
 一条容易被忽略的一致性约束：**网关的上限要大于后端的上限。** 反过来的话，后端还没机会回 413，Nginx 已经把连接掐了——也就是引子里那种现象。
 
-### 8.4 让 Tomcat 的静默 `IOException` 说话
+### 7.4 让 Tomcat 的静默 `IOException` 说话
 
 把 `org.apache.coyote` 的日志级别临时开到 DEBUG，能看到 `abstractConnectionHandler.ioexception.debug` 那条消息。四种策略的代价：
 
@@ -497,9 +497,9 @@ location /api/upload {
 
 生产上更稳的组合是**网关先拦 + 后端保留默认 `maxSwallowSize` + 拒绝路径写完整日志**：把"连接被重置"变成"客户端收到了 413 JSON"。
 
-## 九、不落盘：流式直传对象存储
+## 八、不落盘：流式直传对象存储
 
-### 9.1 "先落盘再上传"浪费在哪
+### 8.1 "先落盘再上传"浪费在哪
 
 `file-size-threshold` 默认 `0B`，意味着 Tomcat 几乎会把每个 part 都写进磁盘——写到哪由 `MultipartConfigElement` 的 `location` 决定，没配就是容器临时目录。于是最常见的写法是这样：
 
@@ -514,7 +514,7 @@ Files.deleteIfExists(tmp);                  // ③ 还得记得删
 
 一次上传，数据落两遍盘、读两遍。**这段代码里唯一必要的动作是第 ② 步。**
 
-### 9.2 边收边写：把 part 的流直接交给 SDK
+### 8.2 边收边写：把 part 的流直接交给 SDK
 
 把 9.1 里唯一必要的那一步单独写出来，就是一个完整实现：
 
@@ -542,14 +542,14 @@ public class DirectUploadService {
 
 `RequestBody.fromInputStream(InputStream, long)` 的第二个参数是必需的，它和 `contentLength(...)` 声明的是同一个长度，**两处必须一致**。写错的后果不是"被拒"，而是**静默丢数据**：SDK 的 javadoc 写明，**声明长度小于实际内容时，客户端会把流截断到声明的字节数、只发这么多，且不报错**；反过来声明长度大于实际内容时，服务端等不到足够的字节，请求才会失败。前者最危险——业务侧会以为文件传完了。`S3Client.putObject(PutObjectRequest, RequestBody)` 是 SDK v2 的标准签名。
 
-### 9.3 流式直传的四条边界
+### 8.3 流式直传的四条边界
 
 - **一次性的流不可重放，所以不可重试。** `InputStream` 只能读一遍，SDK 的重试在流式 body 上无法重新读取。要重试就得放在可重放的载体上（本地文件、字节数组），或者接受"失败即让客户端重传"——后者正是分片上传要解决的问题。
 - **超时要覆盖两端。** 一次请求里串了"客户端传到应用"和"应用传到对象存储"两段，按**两段之和**估。
 - **"不落盘"不等于零内存。** 容器读 socket 有自己的缓冲，SDK 写 HTTP 也有缓冲。省掉的是**应用自己那一次额外的落盘与读取**。
 - **失败语义变粗。** 对象存储写失败时请求体可能已被消费一部分，没法回滚，只能让客户端整份重来。
 
-### 9.4 `transferTo` 的四个坑
+### 8.4 `transferTo` 的四个坑
 
 它的 javadoc 写得很直白：目标已存在会先被删除；**如果文件在文件系统里是被"移动"过去的，这个操作之后就不能再调用了，所以只能调一次。**
 
@@ -593,7 +593,7 @@ if (dest.isAbsolute() && !dest.exists()) {
 
 这段兜底是**尽力而为**：只在"目标不存在"时才触发。
 
-### 9.5 分片上传、断点续传、秒传的骨架
+### 8.5 分片上传、断点续传、秒传的骨架
 
 大文件不要走单请求。最小骨架三步：
 
@@ -628,9 +628,9 @@ AWS 文档给的硬数字要先拿来框住方案：**单次 PUT 最大 5 GB**�
 - **秒传。** 上传前先算整文件摘要，命中"摘要 → 对象"映射就直接建引用。四条取舍：客户端要能算摘要；摘要必须能**流式**算；服务端要防止"拿别人的摘要引用别人的文件"（至少校验对象大小）；分片上传时整文件摘要客户端不方便算，常见替代是用各片 ETag 拼出对象 ETag 对账。
 - **别忘回收。** 没有 complete 的 multipart upload 会一直占着存储和计费，要配生命周期规则定时中止。
 
-## 十、绕过应用进程：预签名 URL 直传
+## 九、绕过应用进程：预签名 URL 直传
 
-### 10.1 三种数据路径
+### 9.1 三种数据路径
 
 下载篇用「五、架构层」把传输从应用进程里剥离出去，上传这边是同一个问题的镜像：
 
@@ -649,7 +649,7 @@ AWS 文档给的硬数字要先拿来框住方案：**单次 PUT 最大 5 GB**�
 
 最关键的一行是"写入前能否看到内容"：**预签名直传把数据面交出去的同时，也交出了"在写入之前检查内容"的能力。** 这是它唯一且无法绕过的代价。
 
-### 10.2 服务端：只签一个 PUT
+### 9.2 服务端：只签一个 PUT
 
 服务端只做一件事——生成一个带签名的 PUT 地址：
 
@@ -677,7 +677,7 @@ public Map<String, Object> presign(@RequestBody PresignRequest req) {
 
 把 `contentType` 和 `contentLength` 一起签进去是有意为之：**它们进入签名，客户端就改不动了。** 不签的话，一个"只允许传 2 MB 图片"的 URL 可以被拿去传别的东西。
 
-### 10.3 客户端：浏览器直接 PUT
+### 9.3 客户端：浏览器直接 PUT
 
 客户端拿到的就是一个能直接 PUT 的 URL，全程不经过后端：
 
@@ -701,7 +701,7 @@ await fetch('/api/uploads/commit', {          // 让后端确认并落库
 });
 ```
 
-### 10.4 直传的边界条件
+### 9.4 直传的边界条件
 
 - **单次 PUT 有大小上限。** S3 单次 PUT 最大 5 GB，超过必须走分片；而分片直传要**逐片签名**——`uploadId` 和 `partNumber` 都要进入签名，不能一个签名复用所有片。
 - **签名只管"能不能写"，不管"写了什么"。** 所以 key 必须由服务端决定，前缀按租户隔离。
@@ -710,9 +710,9 @@ await fetch('/api/uploads/commit', {          // 让后端确认并落库
 - **有效期是安全边界，而且有硬上限。** 有效期内同一 URL 可反复 PUT（覆盖语义），TTL 越长泄漏后可利用时间越久。`S3Presigner` 的类注释写明预签名有效期**不能超过 7 天**（生成时就报错），所以 15 分钟这类短 TTL 是常规起点而不是硬性规定。
 - **内容校验只能后置。** 需要查毒 / 转码时，唯一可行的做法是"上传完成后触发异步任务，不通过就删除对象"，并把状态告诉业务方。**这一步漏掉，直传就是一个任意文件落地入口。**
 
-## 十一、安全与工程清单
+## 十、安全与工程清单
 
-### 11.1 `getOriginalFilename()` 不可信
+### 10.1 `getOriginalFilename()` 不可信
 
 这是 Spring 自己在 javadoc 里写明的：文件名可能包含目录部分，可能包含 `..` 这类恶意字符，**建议不要直接使用，而是自己生成唯一文件名**。而它的实现就是把 `Content-Disposition` 里解析出的字符串原样返回：
 
@@ -740,7 +740,7 @@ if (!target.startsWith(root)) {
 }
 ```
 
-### 11.2 空字节：Tomcat 会拦，但拦的方式影响错误处理
+### 10.2 空字节：Tomcat 会拦，但拦的方式影响错误处理
 
 文件名里带 `\u0000` 是经典的"骗过后缀校验、截断真实路径"手法。Tomcat 内嵌的 fileupload 直接拒绝：
 
@@ -763,13 +763,13 @@ if (fileName != null && fileName.indexOf('\u0000') != -1) {
 
 两个后果：**不会被包成 `MaxUploadSizeExceededException`**，所以"文件过大"的 advice 接不到它；消息里也没有 exceed/size 关键字，Spring 只会抛通用的 `MultipartException`。**兜底处理器必须存在，否则客户端等到的是一个 500。**
 
-### 11.3 数量与头部：`maxPartCount` / `maxPartHeaderSize`
+### 10.3 数量与头部：`maxPartCount` / `maxPartHeaderSize`
 
 - 单个 part 的头部默认上限 512 字节，超了直接拒绝——这是防止超长 `Content-Disposition` 撑爆内存的第一道。
-- part 个数默认上限 50，参数总数默认上限 10000（外置 Tomcat 见 6.3 的 `server.xml` 说明）。这两个 Boot 没有属性。
+- part 个数默认上限 50，参数总数默认上限 10000（外置 Tomcat 见 5.3 的 `server.xml` 说明）。这两个 Boot 没有属性。
 - 调大之前复习那条公式：`maxPartHeaderSize × maxPartCount × maxConnections × 2`，默认约 400 MB。
 
-### 11.4 扩展名 vs 魔数
+### 10.4 扩展名 vs 魔数
 
 扩展名和 `Content-Type` 都是客户端给的，`Content-Disposition` 里的 `filename` 也是。只按它们做白名单，等于让上传者自己声明"我是安全的"。真正的校验要读文件头：
 
@@ -785,7 +785,7 @@ try (InputStream in = file.getInputStream()) {
 
 这条约束和预签名直传是冲突的——直传时应用在写入前读不到字节。所以**"是否需要写入前强校验"本身就是选择架构的决定性条件**，而不只是安全清单里的一项。
 
-### 11.5 存储位置、临时目录、并发、审计
+### 10.5 存储位置、临时目录、并发、审计
 
 - **绝不落在 webroot。** 上传目录不能位于 Tomcat 的 `webapps/`、`src/main/resources/static` 或任何被静态资源处理器覆盖的路径下。放进去等于给上传者开了一个可访问、可执行的入口。
 - **临时目录会先被打满。** `file-size-threshold` 默认 `0B`，part 直接落盘，并发上传大文件时先耗尽的往往是磁盘而不是内存。要么用 `spring.servlet.multipart.location` 指到独立分区并配配额与监控，要么走预签名直传，本地根本不落。
