@@ -54,7 +54,7 @@ location /api/upload {
 }
 ```
 
-默认 `1m` 来自 [Nginx 官方文档](https://nginx.org/en/docs/http/ngx_http_core_module.html#client_max_body_size)。它可写在 `http` / `server` / `location` 三层，**只在请求真正经过的那一层生效**——放在 `http` 里被内层 `location` 覆盖，是常见的翻车点。
+默认 `1m` 来自 [Nginx 官方文档](https://nginx.org/en/docs/http/ngx_http_core_module.html#client_max_body_size)。它可写在 `http` / `server` / `location` 三层，**只在请求真正经过的那一层生效**——放在 `http` 里被内层 `location` 覆盖，很常见。
 
 超限时 Nginx 自己返回 `413 Request Entity Too Large`，**请求根本不会到后端**。文档还提醒浏览器显示不了这个错误——这正是 7.2 要把它改写成 JSON 的原因。
 
@@ -94,13 +94,13 @@ if (part.getSubmittedFileName() == null) {          // ← 没有文件名 = 普
 
 Boot 只暴露了其中两个：`server.tomcat.max-swallow-size`（2MB）对应 `AbstractHttp11Protocol#setMaxSwallowSize`，`server.tomcat.max-http-form-post-size`（2MB）对应 `Connector#setMaxPostSize`。
 
-**`maxParameterCount` 和 `maxPartCount` 没有对应的 Boot 属性**，要自己加 `TomcatConnectorCustomizer`——它是 Boot 定制内嵌 Tomcat 的回调接口，`factory` 是 `TomcatServletWebServerFactory`：`factory.addConnectorCustomizers(connector -> connector.setMaxPartCount(100))`，`connector` 就是那个 Connector。
+**`maxParameterCount` 和 `maxPartCount` 没有对应的 Boot 属性**，要自己加 `TomcatConnectorCustomizer`（Boot 定制内嵌 Tomcat 的接口）；`factory` 是 `TomcatServletWebServerFactory`：`factory.addConnectorCustomizers(connector -> connector.setMaxPartCount(100))`，`connector` 就是那个 Connector。
 
-调大前先算账。part 的头部要先进内存：每个 part 最多 `maxPartHeaderSize` 字节、单请求最多 `maxPartCount` 个 part，再乘并发连接数 `maxConnections`（默认 8192）和实现开销 ×2，默认就是 512 × 50 × 8192 × 2 ≈ **400 MB**——攻击者占满连接就能把这么多头部压进堆里，所以文档把它列为 DoS 面。
+调大之前，先看代价。part 头部要先进内存。假设攻击者占满 8192 连接（`maxConnections` 的默认值），每条连接发一个塞满 50 个 part（`maxPartCount`）、每个 part 头部写满 512 字节（`maxPartHeaderSize`）的请求——按文档估算，光头部就要占 512 × 50 × 8192 × 2 ≈ **400 MB** 堆内存。不用传文件内容，靠连接数和 header 就能顶上去，这就是文档把 `maxPartCount` 列为 DoS 面的原因。调大它，上界按比例涨。
 
 ### 5.4 第三道：上限是 Spring 定的，Tomcat 只负责抛
 
-Tomcat 抛异常时并不知道上限是多少——这个数不在它的配置里，是 Spring 在注册 Servlet 时交给它的。送进解析器的就是这几项：
+Tomcat 抛异常时并不知道上限是多少——这个数是 Spring 在注册 Servlet 时交给它的。送进解析器的就是这几项：
 
 ```yaml
 spring:
@@ -156,7 +156,7 @@ while (remaining > 0) {
 3. Spring 把它翻译成 `MaxUploadSizeExceededException`，写出 413；此时请求体还剩约 100 MB，超过 `maxSwallowSize`，`checkMaxSwallowSize()` 关掉 keep-alive；
 4. `IdentityInputFilter.end()` 吞到第 2 MiB 时抛 `IOException`，连接随即被关——客户端还在写，收到 RST；已经写进 socket 缓冲的那份 413 也随连接消失，浏览器报 `ERR_CONNECTION_RESET`。
 
-引子里"切成 5 MB 分片就正常"也在这里有了答案：每一片都远小于四道限额，根本没走到"拒绝—吞噬"这条路径。
+引子里"切成 5 MB 分片就正常"也有了答案：每一片都远小于四道限额，根本没走到"拒绝—吞噬"这条路径。
 
 `isError` 变 true 后，`AbstractProcessor#service` 收尾会 `response.setStatus(500)`，但响应已 commit，改不动报文，只让访问日志里出现一个 500：前端说连接重置、访问日志说 500、应用日志什么都没有。
 
@@ -290,7 +290,7 @@ public class MaxUploadSizeExceededException extends MultipartException implement
 | 响应已经 commit | `handleErrorResponse` 只在响应未提交时改状态码，已提交就只打一条 warn |
 | 连接已经被关 | 处理器可能跑了，但写出去的字节没人读——5.5 那条路 |
 
-这里有个容易踩的组合：`MultipartFilter`（Spring 提供的一个 Servlet Filter，让不经过 DispatcherServlet 的请求也能拿到解析后的 multipart）在 DispatcherServlet **之前**解析，异常发生在 filter 里，`@ControllerAdvice` 完全看不到。
+有个容易踩的组合：`MultipartFilter`（Spring 提供的一个 Servlet Filter，让不经过 DispatcherServlet 的请求也能拿到解析后的 multipart）在 DispatcherServlet **之前**解析，异常发生在 filter 里，`@ControllerAdvice` 完全看不到。
 
 ## 七、把「失败」变成可诊断的响应
 
@@ -470,7 +470,7 @@ public Map<String, Object> presign(@RequestBody PresignRequest req) {
 
 ### 9.4 直传的边界条件
 
-- **单次 PUT 有大小上限。** S3 单次 PUT 最大 5 GB，超过必须走分片：最多 10000 片、每片 5 MiB~5 GiB，片间可并发、合并按片号排序（完成顺序不影响结果）；分片直传还要**逐片签名**——`uploadId` 和 `partNumber` 都要进入签名。
+- **单次 PUT 有大小上限。** S3 单次 PUT 最大 5 GB，超过必须走分片：最多 10000 片、每片 5 MiB~5 GiB，片间可并发、合并按片号排序；分片直传还要**逐片签名**——`uploadId` 和 `partNumber` 都要进入签名。
 - **完成后必须校验一次。** 后端要用 `headObject` 确认对象确实存在、大小符合预期。
 - **有效期是安全边界，而且有硬上限。** 有效期内同一 URL 可反复 PUT（覆盖语义），TTL 越长泄漏后可利用时间越久；S3 预签名有效期**不能超过 7 天**，所以 15 分钟这类短 TTL 是常规起点而不是硬性规定。
 - **内容校验只能后置。** 需要查毒 / 转码时，唯一可行的做法是"上传完成后触发异步任务，不通过就删除对象"，并把状态告诉业务方。**这一步漏掉，直传就是一个任意文件落地入口。**
@@ -498,7 +498,7 @@ Path target = root.resolve(name).normalize();
 if (!target.startsWith(root)) throw new IllegalArgumentException("illegal file name");
 ```
 
-同一个入口还有一类更隐蔽的输入：文件名里的空字节（`\u0000`），经典的"骗过后缀校验、截断真实路径"手法。Tomcat 内嵌的 fileupload 会直接拒绝：
+同一个入口还有更隐蔽的输入：文件名里的空字节（`\u0000`），经典的"骗过后缀校验、截断真实路径"手法。Tomcat 内嵌的 fileupload 会直接拒绝：
 
 ```java
 // org.apache.tomcat.util.http.fileupload.util.Streams#checkFileName
