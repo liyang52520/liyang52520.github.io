@@ -161,7 +161,7 @@ while (remaining > 0) {
 |:---|:---|:---|:---|:---|
 | Nginx / 网关 | 请求体 > `client_max_body_size`（默认 1m） | `413` | Nginx 错误页；浏览器可能显示不了 | 无，请求没到应用 |
 | Tomcat `maxPostSize` | 表单字段累计超 2 MiB（文件不计） | 无固定值 | 取决于应用 | 默认无 |
-| Tomcat `maxPartCount` / `maxParameterCount` | part 或参数个数超限 | 无固定值（`FailedRequestFilter` 默认没开；打开后 part 超限 413、参数超限 400） | 取决于应用 | 默认无 |
+| Tomcat `maxPartCount` / `maxParameterCount` | part 或参数个数超限 | 无固定值（`FailedRequestFilter` 默认关；打开后 part 超限 413、参数超限 400） | 取决于应用 | 默认无 |
 | Spring `max-file-size` / `max-request-size` | 单文件或请求体超限 | Boot 3.2+ 是 `413`；Boot 3.0/3.1 与 2.x 是 `500` | 可能拿到 413，也可能被重置 | 默认几乎无 |
 | Tomcat `maxSwallowSize` | 拒绝之后客户端还在发，剩余 > 2 MiB | **无** | `ERR_CONNECTION_RESET` | 默认无（DEBUG 才有） |
 
@@ -260,7 +260,7 @@ ResponseEntity<String> local() { return ResponseEntity.status(413).body("local")
 ResponseEntity<String> global() { return ResponseEntity.status(413).body("global"); }
 ```
 
-发一个 100 MB 请求，客户端拿到的是 `global`——`local` 一次都不会执行。局部处理器要先有"所属的 Controller"，而请求在 `getHandler` 之前就被拒。
+发一个 100 MB 请求，客户端拿到的是 `global`——`local` 一次都不会执行。局部处理器要先有所属的 Controller，而请求在 `getHandler` 之前就被拒。
 
 还有个开关：把 `resolve-lazily` 设成 `true`，解析推迟到参数解析阶段，那时 `handlerMethod` 已经有值，Controller 里的局部处理器就能生效了。
 
@@ -277,7 +277,7 @@ public class MaxUploadSizeExceededException extends MultipartException implement
 }
 ```
 
-所以即便你什么都不写，优先级最低的 `DefaultHandlerExceptionResolver` 也会兜底：响应未提交时执行 `sendError(413)`；已提交则只打一条 warn，因为改不动报文了。**客户端拿到的 413 很可能不是你写的，是它送的。**
+即便你什么都不写，优先级最低的 `DefaultHandlerExceptionResolver` 也会兜底：响应未提交时执行 `sendError(413)`；已提交则只打一条 warn。**客户端拿到的 413 很可能不是你写的，是它送的。**
 
 **分界点是 Spring 6.1（Boot 3.2），不是 6.0：** 6.0.14 还是 `extends MultipartException`，6.1.0 才 `implements ErrorResponse`；6.0 的兜底解析器虽然早有 `ErrorResponse` 分支，但异常没实现它，所以仍走 500。
 
@@ -360,7 +360,7 @@ location /api/upload {
 
 第三行是另一条路：`checkSwallowInput()` 只在 `swallowAbortedUploads` 为 false 时才下发 `DISABLE_SWALLOW_INPUT`，`AbstractProcessor` 收到后调 `disableSwallowRequest()` 并把状态置为 `CLOSE_CLEAN`。**默认是 `true`，所以默认走的是 5.5 那条"吞到上限再抛 `IOException`"的路。**
 
-生产上更稳的组合是**网关先拦 + 后端保留默认 `maxSwallowSize` + 拒绝路径写完整日志**：把"连接被重置"变成"客户端收到 413 JSON"。
+生产上更稳的组合：网关先拦 + 后端保留默认 `maxSwallowSize` + 拒绝路径写完整日志。
 
 ## 八、少落一次盘：把 part 的流直接交给对象存储
 
@@ -383,11 +383,11 @@ Files.deleteIfExists(tmp);                  // ③ 还得记得删
 
 一次上传，数据落两遍盘、读两遍。**这段代码里唯一必要的动作是第 ② 步。**
 
-`transferTo` 还有两个（一）没解释的坑：落盘的 part 走 `renameTo`，源临时文件被搬走，**只能调一次**，第二次再读原路径会抛 `NoSuchFileException`；目标文件已存在会被**先删掉**——所以路径里别放客户端给的文件名（后果见 10.1）。相对路径的基准在（一）3.2 讲过；绝对路径的兜底是 Spring 的尽力而为。
+`transferTo` 还有两个（一）没解释的坑：落盘的 part 走 `renameTo`，源临时文件被搬走，**只能调一次**，第二次再读原路径会抛 `NoSuchFileException`；目标文件已存在会被**先删掉**——所以路径里别放客户端给的文件名。相对路径的基准在（一）3.2 讲过。
 
 ### 8.2 只做第 ② 步：把 part 的流直接交给 SDK
 
-这里读的是容器已经存好的那份，省掉的是应用自己的第 ① 步。把它单独写出来就是一个完整实现（下面用 AWS SDK v2 举例，依赖是 `software.amazon.awssdk:s3`）：
+这里读的是容器已存好的那份，省掉的是应用的第 ① 步；单独写出来就是一个完整实现（下面用 AWS SDK v2 举例，依赖是 `software.amazon.awssdk:s3`）：
 
 ```java
 @Service
@@ -415,8 +415,8 @@ public class DirectUploadService {
 
 ### 8.3 边读边发的三条边界
 
-- **一次性的流不可重放，所以不可重试。** `InputStream` 只能读一遍，SDK 的重试靠 `InputStream#reset()` 重放，缓冲只有 128 KiB；更大的流重试不了。想可靠重试就得换成可重放的载体（本地文件、字节数组），或者接受"失败即让客户端重传"。
-- **超时要覆盖两端，失败语义也变粗。** 一次请求里串了"客户端传到应用"和"应用传到对象存储"两段，按**两段之和**估；对象存储写失败时请求体可能已被消费一部分，没法回滚，只能让客户端整份重来。
+- **`MultipartFile` 能反复开流，交给 SDK 的那个 `InputStream` 不能。** 每次 `file.getInputStream()` 都新开一个；但 `RequestBody.fromInputStream` 只持有一个流，SDK 重试靠 `reset()`，落盘的 part 返回文件流、不支持 mark/reset，第二次读就抛 `IllegalStateException`。要让 SDK 自己重试，得用每次重试都重新开流的 `ContentStreamProvider`（`RequestBody.fromContentProvider`）。
+- **超时要覆盖两端，失败语义也变粗。** 一次请求里串了"客户端传到应用"和"应用传到对象存储"两段，按**两段之和**估；对象存储写失败时请求体可能已被消费一部分，没法回滚，只能让客户端重来。
 - **"不落盘"不等于零内存。** 容器读 socket 有自己的缓冲，SDK 写 HTTP 也有缓冲。省掉的是**应用自己那一次额外的落盘与读取**。
 
 ## 九、绕过应用进程：预签名 URL 直传
@@ -440,7 +440,7 @@ public class DirectUploadService {
 | 本地落盘 | 至少一次 | 无 | 无 |
 | 适用 | 小文件、需要落地前强校验 | 需要边收边转（加密 / 转码 / 查毒） | 大文件、高并发、内容无关的落地 |
 
-表里的"应用流式转发"指真正的流式模型（WebFlux 的 `PartEvent`，或绕开 servlet multipart 自己读 body）；用 `MultipartFile.getInputStream()` 是从临时文件读，算不上"边收边转"。
+表里的"应用流式转发"指真流式（WebFlux 的 `PartEvent`，或绕开 servlet multipart）；`MultipartFile.getInputStream()` 读的是临时文件，不算。
 
 最关键的一行是"写入前能否看到内容"：**预签名直传把数据面交出去的同时，也交出了"在写入之前检查内容"的能力。** 这是它唯一且无法绕过的代价。
 
@@ -477,9 +477,8 @@ public Map<String, Object> presign(@RequestBody PresignRequest req) {
 ### 9.4 直传的边界条件
 
 - **单次 PUT 有大小上限。** S3 单次 PUT 最大 5 GB，超过必须走分片：最多 10000 片、每片 5 MiB~5 GiB，片间可并发、合并按片号排序；分片直传还要**逐片签名**——`uploadId` 和 `partNumber` 都要进入签名。
-- **完成后必须校验一次。** 后端要用 `headObject` 确认对象确实存在、大小符合预期。
 - **有效期是安全边界，而且有硬上限。** 有效期内同一 URL 可反复 PUT（覆盖语义），TTL 越长泄漏后可利用时间越久；S3 预签名有效期**不能超过 7 天**，所以 15 分钟这类短 TTL 是常规起点而不是硬性规定。
-- **内容校验只能后置。** 需要查毒 / 转码时，唯一可行的做法是"上传完成后触发异步任务，不通过就删除对象"，并把状态告诉业务方。**这一步漏掉，直传就是一个任意文件落地入口。**
+- **完成不等于结束，内容校验只能后置。** 后端要用 `headObject` 确认对象存在、大小符合预期；需要查毒 / 转码时，上传完成后触发异步任务，不通过就删除对象并告知业务方。**这一步漏掉，直传就是一个任意文件落地入口。**
 
 ## 十、数据路径换了，安全责任也跟着换
 
@@ -535,11 +534,11 @@ try (InputStream in = file.getInputStream()) {
 1. **先把四道限额对齐。** 从外到内逐层收窄：最外层网关（Nginx）的 `client_max_body_size` > 后端 `max-request-size` > `max-file-size`。并且记住 `maxPostSize` 只算表单字段，别拿它当文件上限。
 2. **再把拒绝路径做成可读的响应。** 全局 `@ControllerAdvice` + 网关 413 JSON + 留意 `maxSwallowSize` 那条无状态码的路径。这一步投入产出比最高——它把"连接被重置"变成"客户端收到 413 JSON 且后端有日志"。
 3. **然后决定数据路径。** 小文件、要写入前强校验 → 应用内处理；要边收边转（加密 / 转码 / 查毒）→ 流式转发；大文件、高并发、内容无关 → 预签名直传；超大文件 → 无论哪条路都要分片。
-4. **最后才谈优化。** 流式直传省掉的是应用侧那一次额外的落盘与读取；分片带来并发，也带来逐片签名、完成后校验这些新的运维面。
+4. **最后才谈优化。** 流式直传省掉的是应用侧那一次额外的落盘与读取；分片带来并发，也带来逐片签名、完成后校验。
 
 **三个最值得记住的结论：**
 
-1. `maxSwallowSize` 是"故障看起来像网络问题、日志里却什么都没有"的根因，它的异常默认只在 DEBUG 级别可见。
+1. `maxSwallowSize` 是"像网络问题、日志里却没有"的根因，它的异常默认只在 DEBUG 可见。
 2. `@ExceptionHandler` 失效多半不是写错，而是异常抛得太早、太晚，或者根本不经过 `DispatcherServlet`。
 3. 预签名直传最大的代价不是复杂度，是**你放弃了"写入前看到内容"的能力**。
 
