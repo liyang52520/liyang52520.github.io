@@ -114,7 +114,7 @@ Tomcat 抛异常时并不知道上限是多少——这个数是 Spring 在注�
 
 ### 5.5 第四道：拒绝之后，连接怎么收场
 
-前三道至少发生在 HTTP 语义之内：拒绝就是给一个状态码。第四道不在语义里——它决定的是"拒绝之后，剩下的请求体怎么处理"。引子里那个"没有状态码"的故障，就是它造成的。
+前三道在 HTTP 语义之内：拒绝就是给个状态码。第四道不在语义里——它决定的是"拒绝之后，剩下的请求体怎么处理"。引子里那个"没有状态码"的故障，就是它造成的。
 
 HTTP/1.1 的连接可以复用。Tomcat 处理完请求后，若 `keep-alive` 还开着，就必须保证 socket 里下一个字节是下一个请求的起始行。请求体没读完（比如应用已经拒绝并返回 413），这些字节会污染下一个请求——所以 Tomcat 必须把它们读掉丢弃，这个动作叫 **swallow（吞掉）**。`maxSwallowSize` 就是"最多吞多少"，默认 2 MiB，是 `AbstractHttp11Protocol` 里写死的 `2 * 1024 * 1024`。
 
@@ -416,7 +416,7 @@ public class DirectUploadService {
 ### 8.3 边读边发的三条边界
 
 - **`MultipartFile` 能反复开流，交给 SDK 的那个 `InputStream` 不能。** 每次 `file.getInputStream()` 都新开一个；但 `RequestBody.fromInputStream` 只持有一个流，SDK 重试靠 `reset()`，落盘的 part 返回文件流、不支持 mark/reset，第二次读就抛 `IllegalStateException`。要让 SDK 自己重试，得用每次重试都重新开流的 `ContentStreamProvider`（`RequestBody.fromContentProvider`）。
-- **超时要覆盖两端，失败语义也变粗。** 一次请求里串了"客户端传到应用"和"应用传到对象存储"两段，按**两段之和**估；对象存储写失败时请求体可能已被消费一部分，没法回滚，只能让客户端重来。
+- **超时要覆盖两端，失败语义也变粗。** 一次请求里串了"客户端传到应用"和"应用传到对象存储"两段，按**两段之和**估；对象存储写失败时请求体可能已被消费一部分，只能让客户端重来。
 - **"不落盘"不等于零内存。** 容器读 socket 有自己的缓冲，SDK 写 HTTP 也有缓冲。省掉的是**应用自己那一次额外的落盘与读取**。
 
 ## 九、绕过应用进程：预签名 URL 直传
@@ -438,9 +438,9 @@ public class DirectUploadService {
 | 进度回调 | 应用能拿到字节数 | 应用能拿到字节数 | 只有客户端知道 |
 | 失败重试 | 应用内部可重试 | 可重试（body 必须可重放） | 客户端重试同一 URL（有效期内） |
 | 本地落盘 | 至少一次 | 无 | 无 |
-| 适用 | 小文件、需要落地前强校验 | 需要边收边转（加密 / 转码 / 查毒） | 大文件、高并发、内容无关的落地 |
+| 适用 | 小文件、需要落地前强校验 | 需要边收边处理（加密 / 压缩 / 查毒） | 大文件、高并发、内容无关的落地 |
 
-表里的"应用流式转发"指真流式（WebFlux 的 `PartEvent`，或绕开 servlet multipart）；`MultipartFile.getInputStream()` 读的是临时文件，不算。
+表里的"应用流式转发"指真流式（WebFlux 的 `PartEvent`，或绕开 servlet multipart）：客户端传一块，应用就处理一块（加密、压缩、查毒）并转给对象存储，整个文件不在应用里落脚。`MultipartFile.getInputStream()` 读的是临时文件，做不到这一点。
 
 最关键的一行是"写入前能否看到内容"：**预签名直传把数据面交出去的同时，也交出了"在写入之前检查内容"的能力。** 这是它唯一且无法绕过的代价。
 
@@ -476,7 +476,7 @@ public Map<String, Object> presign(@RequestBody PresignRequest req) {
 
 ### 9.4 直传的边界条件
 
-- **单次 PUT 有大小上限。** S3 单次 PUT 最大 5 GB，超过必须走分片：最多 10000 片、每片 5 MiB~5 GiB，片间可并发、合并按片号排序；分片直传还要**逐片签名**——`uploadId` 和 `partNumber` 都要进入签名。
+- **单次 PUT 有大小上限。** S3 单次 PUT 最大 5 GB，超过必须走分片：最多 10000 片、每片 5 MiB~5 GiB，合并按片号排序；分片直传还要**逐片签名**——`uploadId` 和 `partNumber` 都要进入签名。
 - **有效期是安全边界，而且有硬上限。** 有效期内同一 URL 可反复 PUT（覆盖语义），TTL 越长泄漏后可利用时间越久；S3 预签名有效期**不能超过 7 天**，所以 15 分钟这类短 TTL 是常规起点而不是硬性规定。
 - **完成不等于结束，内容校验只能后置。** 后端要用 `headObject` 确认对象存在、大小符合预期；需要查毒 / 转码时，上传完成后触发异步任务，不通过就删除对象并告知业务方。**这一步漏掉，直传就是一个任意文件落地入口。**
 
@@ -503,7 +503,7 @@ Path target = root.resolve(name).normalize();
 if (!target.startsWith(root)) throw new IllegalArgumentException("illegal file name");
 ```
 
-更隐蔽的输入是文件名里的空字节（`\u0000`），经典的"骗过后缀校验、截断真实路径"手法：Tomcat 的 `Streams#checkFileName` 会直接抛 `InvalidFileNameException`，`parseParts` 随后把它包成 `ServletException`（`partsParseException = new ServletException(e)`），而不是 `IllegalStateException`——所以它通常不会被包成 `MaxUploadSizeExceededException`，只会变成通用的 `MultipartException`。**兜底处理器必须存在，否则客户端等到的是一个 500。**
+更隐蔽的输入是文件名里的空字节（`\u0000`），能骗过后缀校验、截断真实路径：Tomcat 的 `Streams#checkFileName` 会直接抛 `InvalidFileNameException`，`parseParts` 随后把它包成 `ServletException`（`partsParseException = new ServletException(e)`），而不是 `IllegalStateException`——所以它通常不会被包成 `MaxUploadSizeExceededException`，只会变成通用的 `MultipartException`。**兜底处理器必须存在，否则客户端等到的是一个 500。**
 
 ### 10.2 内容校验只能后置——这条决定你选哪条路
 
@@ -523,7 +523,7 @@ try (InputStream in = file.getInputStream()) {
 
 ### 10.3 落点与审计：别留可执行入口
 
-上传目录绝不能落在 webroot 或静态资源目录下——那是给上传者开一个可访问、可执行的入口。审计日志记全 key、size、contentType、IP、租户，先过滤控制字符；失败时前后端各留记录，否则又是"三方各说各话"。
+上传目录绝不能落在 webroot 或静态资源目录下——那等于给上传者开一个可访问、可执行的入口。审计日志记全 key、size、contentType、IP、租户，先过滤控制字符；失败时前后端各留记录。
 
 ## 结语：四道限额，三条数据路径
 
@@ -532,8 +532,8 @@ try (InputStream in = file.getInputStream()) {
 压成一套可执行的决策顺序：
 
 1. **先把四道限额对齐。** 从外到内逐层收窄：最外层网关（Nginx）的 `client_max_body_size` > 后端 `max-request-size` > `max-file-size`。并且记住 `maxPostSize` 只算表单字段，别拿它当文件上限。
-2. **再把拒绝路径做成可读的响应。** 全局 `@ControllerAdvice` + 网关 413 JSON + 留意 `maxSwallowSize` 那条无状态码的路径。这一步投入产出比最高——它把"连接被重置"变成"客户端收到 413 JSON 且后端有日志"。
-3. **然后决定数据路径。** 小文件、要写入前强校验 → 应用内处理；要边收边转（加密 / 转码 / 查毒）→ 流式转发；大文件、高并发、内容无关 → 预签名直传；超大文件 → 无论哪条路都要分片。
+2. **再把拒绝路径做成可读的响应。** 全局 `@ControllerAdvice` + 网关 413 JSON + 留意 `maxSwallowSize` 那条无状态码的路径。这一步投入产出比最高：把"连接被重置"变成"收到 413 JSON 且后端有日志"。
+3. **然后决定数据路径。** 小文件、要写入前强校验 → 应用内处理；要边收边处理（加密 / 压缩 / 查毒）→ 真流式转发；大文件、高并发、内容无关 → 预签名直传；超大文件 → 无论哪条路都要分片。
 4. **最后才谈优化。** 流式直传省掉的是应用侧那一次额外的落盘与读取；分片带来并发，也带来逐片签名、完成后校验。
 
 **三个最值得记住的结论：**
