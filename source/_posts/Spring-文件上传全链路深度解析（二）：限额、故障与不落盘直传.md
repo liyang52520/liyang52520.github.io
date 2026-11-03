@@ -362,9 +362,11 @@ location /api/upload {
 
 生产上更稳的组合是**网关先拦 + 后端保留默认 `maxSwallowSize` + 拒绝路径写完整日志**：把"连接被重置"变成"客户端收到 413 JSON"。
 
-## 八、不落盘：把字节直接交给对象存储
+## 八、少落一次盘：把 part 的流直接交给对象存储
 
-前面三章都在回答"为什么失败、怎么诊断"。还有一个更根本的选择：让应用进程根本不碰这份数据。这一章先看"不落盘"省掉了什么，再看它换来的三条约束。
+前面三章都在回答"为什么失败、怎么诊断"。还有一个更根本的选择：让应用进程少碰这份数据。
+
+动手之前先纠正一个容易含糊的前提：**当 `MultipartFile` 被注入到方法参数时，这个文件已经是一个"成品"了。** Tomcat 会在进入你的方法体之前把整个请求体读完——默认是 `checkMultipart` 那一步，开了 `resolve-lazily` 也只是推迟到参数解析——内容要么完整躺在临时文件里，要么完整待在内存中（阈值见 5.4），你拿到的只是一个句柄。所以这一章的"不落盘"，准确说是**应用不再多存一份**；容器解析时的那次落盘（或内存驻留）仍然存在。真要做到字节不落地，得换掉 `MultipartFile` 这套模型——第九章的预签名直传，或者 WebFlux 的流式 multipart（`PartEvent`）。
 
 ### 8.1 "先落盘再上传"浪费在哪
 
@@ -383,9 +385,9 @@ Files.deleteIfExists(tmp);                  // ③ 还得记得删
 
 `transferTo` 还有两个（一）没解释的坑：落盘的 part 走 `renameTo`，源临时文件被搬走，**只能调一次**，第二次再读原路径会抛 `NoSuchFileException`；目标文件已存在会被**先删掉**——所以路径里别放客户端给的文件名（后果见 10.1）。相对路径的基准在（一）3.2 讲过；绝对路径的兜底是 Spring 的尽力而为。
 
-### 8.2 边收边写：把 part 的流直接交给 SDK
+### 8.2 只做第 ② 步：把 part 的流直接交给 SDK
 
-把 8.1 里唯一必要的那一步单独写出来，就是一个完整实现（下面用 AWS SDK v2 举例，依赖是 `software.amazon.awssdk:s3`）：
+这里读的是容器已经存好的那份，省掉的是应用自己的第 ① 步。把它单独写出来就是一个完整实现（下面用 AWS SDK v2 举例，依赖是 `software.amazon.awssdk:s3`）：
 
 ```java
 @Service
@@ -411,7 +413,7 @@ public class DirectUploadService {
 
 `RequestBody.fromInputStream(InputStream, long)` 的第二个参数是必需的，它和 `contentLength(...)` 声明的是同一个长度，**两处必须一致**。写错的后果不是"被拒"，而是**静默丢数据**：声明长度小于实际内容时，客户端只会发声明的字节数、多出来的部分被截断，而且不会报"长度不符"；反过来声明长度大于实际内容时，服务端等不到足够的字节，请求才会失败。前者最危险——业务侧会以为文件传完了。
 
-### 8.3 流式直传的三条边界
+### 8.3 边读边发的三条边界
 
 - **一次性的流不可重放，所以不可重试。** `InputStream` 只能读一遍，SDK 的重试靠 `InputStream#reset()` 重放，缓冲只有 128 KiB；更大的流重试不了。想可靠重试就得换成可重放的载体（本地文件、字节数组），或者接受"失败即让客户端重传"。
 - **超时要覆盖两端，失败语义也变粗。** 一次请求里串了"客户端传到应用"和"应用传到对象存储"两段，按**两段之和**估；对象存储写失败时请求体可能已被消费一部分，没法回滚，只能让客户端整份重来。
@@ -437,6 +439,8 @@ public class DirectUploadService {
 | 失败重试 | 应用内部可重试 | 可重试（body 必须可重放） | 客户端重试同一 URL（有效期内） |
 | 本地落盘 | 至少一次 | 无 | 无 |
 | 适用 | 小文件、需要落地前强校验 | 需要边收边转（加密 / 转码 / 查毒） | 大文件、高并发、内容无关的落地 |
+
+表里的"应用流式转发"指真正的流式模型（WebFlux 的 `PartEvent`，或绕开 servlet multipart 自己读 body）；用 `MultipartFile.getInputStream()` 是从临时文件读，算不上"边收边转"。
 
 最关键的一行是"写入前能否看到内容"：**预签名直传把数据面交出去的同时，也交出了"在写入之前检查内容"的能力。** 这是它唯一且无法绕过的代价。
 
@@ -500,29 +504,7 @@ Path target = root.resolve(name).normalize();
 if (!target.startsWith(root)) throw new IllegalArgumentException("illegal file name");
 ```
 
-更隐蔽的输入是：文件名里的空字节（`\u0000`），经典的"骗过后缀校验、截断真实路径"手法。Tomcat 内嵌的 fileupload 会直接拒绝：
-
-```java
-// org.apache.tomcat.util.http.fileupload.util.Streams#checkFileName
-if (fileName != null && fileName.indexOf('\u0000') != -1) {
-    // 源码先把 \u0000 换成字面量 \0 再拼进消息（sb 的构造这里省略）
-    throw new InvalidFileNameException(fileName, "Invalid file name: ...");
-}
-```
-
-它在 `parseParts` 里走的是另一个分支：
-
-```java
-// org.apache.catalina.connector.Request#parseParts（catch 段，try 里省略）
-try {
-    ...
-} catch (InvalidContentTypeException | InvalidFileNameException e) {
-    parameters.setParseFailedReason(FailReason.INVALID_CONTENT_TYPE);
-    partsParseException = new ServletException(e);      // ← 不是 IllegalStateException
-}
-```
-
-两个后果：**通常不会被包成 `MaxUploadSizeExceededException`**——但原始文件名里若恰好带 `exceed`、`size` 这类词，仍可能被 6.2 的文本匹配误命中；正常情况则只抛 `MultipartException`。**兜底处理器必须存在，否则客户端等到的是一个 500。**
+更隐蔽的输入是文件名里的空字节（`\u0000`），经典的"骗过后缀校验、截断真实路径"手法：Tomcat 的 `Streams#checkFileName` 会直接抛 `InvalidFileNameException`，`parseParts` 随后把它包成 `ServletException`（`partsParseException = new ServletException(e)`），而不是 `IllegalStateException`——所以它通常不会被包成 `MaxUploadSizeExceededException`，只会变成通用的 `MultipartException`。**兜底处理器必须存在，否则客户端等到的是一个 500。**
 
 ### 10.2 内容校验只能后置——这条决定你选哪条路
 
