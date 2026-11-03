@@ -56,7 +56,7 @@ location /api/upload {
 
 默认 `1m` 来自 [Nginx 官方文档](https://nginx.org/en/docs/http/ngx_http_core_module.html#client_max_body_size)。它可写在 `http` / `server` / `location` 三层，**只在请求真正经过的那一层生效**——放在 `http` 里被内层 `location` 覆盖，很常见。
 
-超限时 Nginx 自己返回 `413 Request Entity Too Large`，**请求根本不会到后端**。文档还提醒浏览器显示不了这个错误——这正是 7.2 要把它改写成 JSON 的原因。
+超限时 Nginx 自己返回 `413 Request Entity Too Large`，**请求根本不会到后端**。文档还提醒浏览器显示不了它——这正是 7.2 要改写成 JSON 的原因。
 
 ### 5.3 第二道：`maxPostSize` 管的不是文件，是表单字段
 
@@ -65,12 +65,10 @@ Connector 上有五个数，最容易配错的是 `maxPostSize`。"上传上限�
 | 属性 | 默认值 | 限制的是什么 |
 |:---|:---|:---|
 | `maxPostSize` | `2097152`（2 MiB） | 会被转换成请求参数的请求体字节数 |
-| `maxParameterCount` | `10000` | 参数 + 上传文件的总个数，超出部分被忽略 |
+| `maxParameterCount` | `10000`（外置 `server.xml` 配成 1000） | 参数 + 上传文件的总个数，超出部分被忽略 |
 | `maxPartCount` | `50` | `multipart/form-data` 的 part 个数上限 |
 | `maxPartHeaderSize` | `512` | 每个 part 的头部字节上限，超出直接拒绝 |
 | `maxSwallowSize` | `2097152`（2 MiB） | 连接层"吞掉"未读请求体的上限 |
-
-`maxParameterCount` 源码注释写 10000，但外置 Tomcat 的 `server.xml` 会配成 1000；**Boot 内嵌容器不读 `server.xml`**，所以内嵌是 10000。
 
 `maxPostSize` 是最大的坑：Tomcat 文档明确说它**不是请求体总大小的通用上限**，只在 Tomcat 为解析参数而处理请求体时生效。落到 `multipart/form-data` 上，它只约束"用来生成 `getParameter()` 那批数据"，也就是普通表单字段：
 
@@ -100,7 +98,7 @@ Boot 只暴露了其中两个：`server.tomcat.max-swallow-size`（2MB）对应 
 
 ### 5.4 第三道：上限是 Spring 定的，Tomcat 只负责抛
 
-Tomcat 抛异常时并不知道上限是多少——这个数是 Spring 在注册 Servlet 时交给它的。送进解析器的就是这几项：
+Tomcat 抛异常时并不知道上限是多少——这个数是 Spring 在注册 Servlet 时交给它的。送进解析器的就这几项：
 
 | 配置项（`spring.servlet.multipart.*`） | 默认值 | 作用 |
 |:---|:---|:---|
@@ -110,7 +108,7 @@ Tomcat 抛异常时并不知道上限是多少——这个数是 Spring 在注�
 | `location` | 容器临时目录 | 落盘的目录 |
 | `resolve-lazily` | false | 是否推迟到真正用到时再解析 |
 
-这些值来自 `MultipartProperties`，被写进 `MultipartConfigElement`，再交给 Tomcat 内嵌的 fileupload——`Request#parseParts` 里就两行：`upload.setFileSizeMax(mce.getMaxFileSize())` 与 `upload.setSizeMax(mce.getMaxRequestSize())`。
+这些值来自 `MultipartProperties`，写进 `MultipartConfigElement`，再交给 Tomcat 内嵌的 fileupload——`Request#parseParts` 里就两行：`upload.setFileSizeMax(mce.getMaxFileSize())` 与 `upload.setSizeMax(mce.getMaxRequestSize())`。
 
 `StandardServletMultipartResolver` 的类注释里有一句关键的话：**这些设置在 Servlet 容器层面被应用，容器不允许从 `MultipartResolver` 层面去改。** 所以别指望用 `MultipartResolver` bean 设上限。
 
@@ -122,7 +120,7 @@ HTTP/1.1 的连接可以复用。Tomcat 处理完请求后，若 `keep-alive` �
 
 超了会怎样？准备响应头时，`Http11Processor#checkMaxSwallowSize` 拿"剩余待吞字节"和上限比，要吞的比允许的多，就把 `keepAlive` 置为 false，补一个 `Connection: close`。另外 413 本身也在 `statusDropsConnection` 的名单里（和 400、408、411、414、500、503、501 并列），一旦返回它就放弃复用连接。
 
-真正下手的是 Tomcat 的 InputFilter（和 Servlet Filter 不是一回事）：
+真正下手的是 Tomcat 的 InputFilter：
 
 ```java
 // org.apache.coyote.http11.filters.IdentityInputFilter#end
@@ -184,14 +182,7 @@ if (requestSize != -1 && requestSize > sizeMax) {
 }
 ```
 
-**它拿 `Content-Length` 先判，body 一个字节都没读。** 单个文件超 `max-file-size` 时，解析器有两种发现时机：有 `Content-Length` 就在构造 part 时预判，chunked 则读到超限才炸——两处抛的都是包了一层 `FileUploadIOException` 的 `FileSizeLimitExceededException`。异常层级是：
-
-```text
-FileUploadException
-└── SizeException（抽象）
-    ├── SizeLimitExceededException      请求体超过 maxRequestSize
-    └── FileSizeLimitExceededException  单个文件超过 maxFileSize
-```
+**它拿 `Content-Length` 先判，body 一个字节都没读。** 单个文件超 `max-file-size` 时，解析器有两种发现时机：有 `Content-Length` 就在构造 part 时预判，chunked 则读到超限才炸——两处抛的都是包了一层 `FileUploadIOException` 的 `FileSizeLimitExceededException`。异常层级是：`SizeException` 下分 `SizeLimitExceededException`（请求体超限）和 `FileSizeLimitExceededException`（单文件超限）。
 
 `FileCountLimitExceededException`（part 个数超限）直接继承 `FileUploadException`，不在 `SizeException` 之下——这个差别后面会用上。
 
@@ -232,9 +223,9 @@ protected void handleParseFailure(Throwable ex) {
 }
 ```
 
-这是本篇最值得盯住的代码。**Spring 认不出异常类型，它是在遍历 cause 链、匹配异常消息文本。** 两个后果：
+这是本篇最值得盯的代码。**Spring 认不出异常类型，它是在遍历 cause 链、匹配异常消息文本。** 两个后果：
 
-- 命中条件是"消息里同时有 exceed 和 size/length"（或 request + big/large）。Tomcat 的英文消息恰好满足；**换个容器、换个语言环境、或换一个自定义包装异常，这条匹配就可能失手**，退化成 `MultipartException`。
+- 命中条件是"消息里同时有 exceed 和 size/length"（或 request + big/large）。Tomcat 的英文消息恰好满足；**换个容器、换个语言环境、或换一层包装，这条匹配就可能失手**，退化成 `MultipartException`。
 - 即便命中，上限也是 **-1**。`getMaxUploadSize()` 返回 -1 只表示"上限未知"——真实的 `max-file-size` / `max-request-size` 已经在这一路包装里丢掉了，**不要拿它拼错误文案**。
 
 ### 6.3 抛得太早：解析发生在知道该由哪个 Controller 处理之前
@@ -253,11 +244,25 @@ catch (Exception ex) {
 processDispatchResult(processedRequest, response, mappedHandler, mv, dispatchException);
 ```
 
-抛异常时 `mappedHandler` 还是 `null`，这个 `null` 一路传到异常解析器。`ExceptionHandlerExceptionResolver` 的第一道判断是 `if (handlerMethod != null)`——局部 `@ExceptionHandler` 只有 handler 已解析出来时才会被考虑；handler 为 null 时，只剩全局 `@ControllerAdvice`。
+抛异常时 `mappedHandler` 还是 `null`，一路传到异常解析器。`ExceptionHandlerExceptionResolver` 的第一道判断是 `if (handlerMethod != null)`——局部 `@ExceptionHandler` 只有 handler 已解析出来时才会被考虑；handler 为 null 时，只剩全局 `@ControllerAdvice`。
 
 结论很硬：**写在 Controller 里的 `@ExceptionHandler(MaxUploadSizeExceededException.class)` 不会被执行，只有全局 `@ControllerAdvice` 的会。** 因为异常在"知道该由哪个 Controller 处理"之前就抛出来了。
 
-另一个开关能解释这种不一致：把 `resolve-lazily` 设成 `true`，解析推迟到参数解析阶段，那时 `handlerMethod` 已经有值，Controller 里的局部处理器就能生效了。
+最小例子：
+
+```java
+// Controller 里：不会执行
+@ExceptionHandler(MaxUploadSizeExceededException.class)
+ResponseEntity<String> local() { return ResponseEntity.status(413).body("local"); }
+
+// @RestControllerAdvice 里：会执行
+@ExceptionHandler(MaxUploadSizeExceededException.class)
+ResponseEntity<String> global() { return ResponseEntity.status(413).body("global"); }
+```
+
+发一个 100 MB 请求，客户端拿到的是 `global`——`local` 一次都不会执行。局部处理器要先有"所属的 Controller"，而请求在 `getHandler` 之前就被拒。
+
+还有个开关：把 `resolve-lazily` 设成 `true`，解析推迟到参数解析阶段，那时 `handlerMethod` 已经有值，Controller 里的局部处理器就能生效了。
 
 ### 6.4 没人接，也未必是 500
 
@@ -274,7 +279,7 @@ public class MaxUploadSizeExceededException extends MultipartException implement
 
 所以即便你什么都不写，优先级最低的 `DefaultHandlerExceptionResolver` 也会兜底：响应未提交时执行 `sendError(413)`；已提交则只打一条 warn，因为改不动报文了。**客户端拿到的 413 很可能不是你写的，是它送的。**
 
-**这处分界容易被画错：分界点是 Spring 6.1（Boot 3.2），不是 6.0。** 核对 `v6.0.14` 与 `v6.1.0` 的类声明：前者仍是 `extends MultipartException`，后者才 `implements ErrorResponse`（提交 `3b80f2c4`，提交信息自述把状态码从 500 改成 413）。另外，`DefaultHandlerExceptionResolver` 的 `ErrorResponse` 分支 6.0.0 就已存在，只是 6.0 的异常没实现它，所以依然走 500。
+**分界点是 Spring 6.1（Boot 3.2），不是 6.0：** 6.0.14 还是 `extends MultipartException`，6.1.0 才 `implements ErrorResponse`；6.0 的兜底解析器虽然早有 `ErrorResponse` 分支，但异常没实现它，所以仍走 500。
 
 所以正确读法是：**Boot 2.x（5.3.x）和 Boot 3.0 / 3.1（6.0.x）→ 500；Boot 3.2+（6.1+）→ 413。**
 
@@ -295,7 +300,7 @@ public class MaxUploadSizeExceededException extends MultipartException implement
 
 ### 7.1 全局 advice：让每次拒绝都留痕
 
-这份 advice 只有两个方法，补的正是 6.2 和 6.3 的缺口。
+这份 advice 只有两个方法，补的正是 6.2、6.3 的缺口。
 
 ```java
 @RestControllerAdvice
@@ -350,10 +355,10 @@ location /api/upload {
 |:---|:---|:---|
 | 默认 | `max-swallow-size` 2MB | 超限就断连；日志默认静默 |
 | 放大或关闭上限 | 调大 `server.tomcat.max-swallow-size` | 处理线程会被"吞请求体"占住（Tomcat 侧小于 0 表示不限制） |
-| 干脆不吞 | Context 属性 `swallowAbortedUploads = false`（Tomcat 的 `StandardContext` 里默认 `true`）；内嵌场景用 `TomcatContextCustomizer` 设 | 连接立即关闭，响应可能到不了客户端；线程立刻释放 |
+| 干脆不吞 | Context 属性 `swallowAbortedUploads = false`（`StandardContext` 默认 `true`）；内嵌用 `TomcatContextCustomizer` 设 | 连接立即关闭，响应可能到不了客户端 |
 | 网关先拦 | `client_max_body_size` | 上限要和后端对齐 |
 
-第三行是另一条代码路径：`checkSwallowInput()` 只在 `swallowAbortedUploads` 为 false 时才下发 `DISABLE_SWALLOW_INPUT`，`AbstractProcessor` 收到后调 `disableSwallowRequest()` 并把状态置为 `CLOSE_CLEAN`（可写完响应、但连接必须关）。**默认是 `true`，所以默认走的是 5.5 那条"吞到上限再抛 `IOException`"的路。**
+第三行是另一条路：`checkSwallowInput()` 只在 `swallowAbortedUploads` 为 false 时才下发 `DISABLE_SWALLOW_INPUT`，`AbstractProcessor` 收到后调 `disableSwallowRequest()` 并把状态置为 `CLOSE_CLEAN`。**默认是 `true`，所以默认走的是 5.5 那条"吞到上限再抛 `IOException`"的路。**
 
 生产上更稳的组合是**网关先拦 + 后端保留默认 `maxSwallowSize` + 拒绝路径写完整日志**：把"连接被重置"变成"客户端收到 413 JSON"。
 
@@ -363,7 +368,7 @@ location /api/upload {
 
 ### 8.1 "先落盘再上传"浪费在哪
 
-`file-size-threshold` 默认 `0B`，意味着 Tomcat 几乎会把每个 part 都写进磁盘——写到哪由 `MultipartConfigElement` 的 `location` 决定，没配就是容器临时目录。最常见的写法是这样（示意：`file` 是 `MultipartFile`，`ossClient` 泛指任意对象存储 SDK）：
+`file-size-threshold` 默认 `0B`，意味着 Tomcat 几乎会把每个 part 都写进磁盘——写到哪由 `MultipartConfigElement` 的 `location` 决定，没配就是容器临时目录。最常见的写法是这样（示意：`file` 是 `MultipartFile`，`ossClient` 是存储 SDK）：
 
 ```java
 Path tmp = Paths.get("/data/upload-tmp", UUID.randomUUID().toString());
@@ -376,7 +381,7 @@ Files.deleteIfExists(tmp);                  // ③ 还得记得删
 
 一次上传，数据落两遍盘、读两遍。**这段代码里唯一必要的动作是第 ② 步。**
 
-`transferTo` 还有两个（一）没解释的坑：落盘的 part 走 `renameTo`，源临时文件被搬走，**只能调一次**，第二次再读原路径会抛 `NoSuchFileException`；目标文件已存在会被**先删掉**——所以路径里别放客户端给的文件名（后果见 10.1）。相对路径的基准在（一）3.2 讲过；绝对路径的兜底则是 Spring 的尽力而为，Servlet 规范并没保证 `Part.write` 支持绝对路径。
+`transferTo` 还有两个（一）没解释的坑：落盘的 part 走 `renameTo`，源临时文件被搬走，**只能调一次**，第二次再读原路径会抛 `NoSuchFileException`；目标文件已存在会被**先删掉**——所以路径里别放客户端给的文件名（后果见 10.1）。相对路径的基准在（一）3.2 讲过；绝对路径的兜底是 Spring 的尽力而为。
 
 ### 8.2 边收边写：把 part 的流直接交给 SDK
 
@@ -437,7 +442,7 @@ public class DirectUploadService {
 
 ### 9.2 服务端：只签一个 PUT
 
-服务端只做一件事——生成一个带签名的 PUT 地址：
+服务端只生成一个带签名的 PUT 地址：
 
 ```java
 @PostMapping("/api/uploads/presign")
@@ -495,7 +500,7 @@ Path target = root.resolve(name).normalize();
 if (!target.startsWith(root)) throw new IllegalArgumentException("illegal file name");
 ```
 
-同一个入口还有更隐蔽的输入：文件名里的空字节（`\u0000`），经典的"骗过后缀校验、截断真实路径"手法。Tomcat 内嵌的 fileupload 会直接拒绝：
+更隐蔽的输入是：文件名里的空字节（`\u0000`），经典的"骗过后缀校验、截断真实路径"手法。Tomcat 内嵌的 fileupload 会直接拒绝：
 
 ```java
 // org.apache.tomcat.util.http.fileupload.util.Streams#checkFileName
@@ -537,7 +542,7 @@ try (InputStream in = file.getInputStream()) {
 
 ### 10.3 落点与审计：别留可执行入口
 
-上传目录绝不能落在 webroot 或静态资源目录下——那是给上传者开一个可访问、可执行的入口。审计日志记全 key、size、contentType、IP、租户，先过滤控制字符；失败时前后端各留记录，否则就是引子里那种"三方各说各话"。
+上传目录绝不能落在 webroot 或静态资源目录下——那是给上传者开一个可访问、可执行的入口。审计日志记全 key、size、contentType、IP、租户，先过滤控制字符；失败时前后端各留记录，否则又是"三方各说各话"。
 
 ## 结语：四道限额，三条数据路径
 
@@ -553,7 +558,7 @@ try (InputStream in = file.getInputStream()) {
 **三个最值得记住的结论：**
 
 1. `maxSwallowSize` 是"故障看起来像网络问题、日志里却什么都没有"的根因，它的异常默认只在 DEBUG 级别可见。
-2. `@ExceptionHandler` 失效多半不是写错了，而是异常抛出得太早（`checkMultipart` 早于 `getHandler`）、太晚（响应已 commit、连接已关），或者干脆不经过 `DispatcherServlet`。
+2. `@ExceptionHandler` 失效多半不是写错，而是异常抛得太早、太晚，或者根本不经过 `DispatcherServlet`。
 3. 预签名直传最大的代价不是复杂度，是**你放弃了"写入前看到内容"的能力**。
 
 ### 延伸阅读
