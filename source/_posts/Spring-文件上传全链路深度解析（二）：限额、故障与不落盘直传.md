@@ -70,7 +70,7 @@ Connector 上有五个数，最容易配错的是 `maxPostSize`。"上传上限�
 | `maxPartHeaderSize` | `512` | 每个 part 的头部字节上限，超出直接拒绝 |
 | `maxSwallowSize` | `2097152`（2 MiB） | 连接层"吞掉"未读请求体的上限 |
 
-`maxParameterCount` 容易对不上：`Connector` 源码注释写 10000，但 Tomcat 自带的 `server.xml` 配成 1000；**Spring Boot 内嵌容器不读 `server.xml`**，所以内嵌是 10000，外置才是 1000。
+`maxParameterCount` 源码注释写 10000，但外置 Tomcat 的 `server.xml` 会配成 1000；**Boot 内嵌容器不读 `server.xml`**，所以内嵌是 10000。
 
 `maxPostSize` 是最大的坑：Tomcat 文档明确说它**不是请求体总大小的通用上限**，只在 Tomcat 为解析参数而处理请求体时生效。落到 `multipart/form-data` 上，它只约束"用来生成 `getParameter()` 那批数据"，也就是普通表单字段：
 
@@ -102,18 +102,15 @@ Boot 只暴露了其中两个：`server.tomcat.max-swallow-size`（2MB）对应 
 
 Tomcat 抛异常时并不知道上限是多少——这个数是 Spring 在注册 Servlet 时交给它的。送进解析器的就是这几项：
 
-```yaml
-spring:
-  servlet:
-    multipart:
-      max-file-size: 10MB        # 默认 1MB
-      max-request-size: 20MB     # 默认 10MB
-      file-size-threshold: 0B     # 默认 0B：几乎所有文件都直接落盘
-      location: /data/upload-tmp
-      resolve-lazily: false      # 默认 false：进入 DispatcherServlet 就解析
-```
+| 配置项（`spring.servlet.multipart.*`） | 默认值 | 作用 |
+|:---|:---|:---|
+| `max-file-size` | 1MB | 单个文件的大小上限 |
+| `max-request-size` | 10MB | 整个请求体的大小上限 |
+| `file-size-threshold` | 0B | 超过这个值才落盘；0 表示第一个字节就落盘 |
+| `location` | 容器临时目录 | 落盘的目录 |
+| `resolve-lazily` | false | 是否推迟到真正用到时再解析 |
 
-默认值来自 `MultipartProperties`。它们被写进 `MultipartConfigElement`，再交给 Tomcat 内嵌的 fileupload——`Request#parseParts` 里就两行：`upload.setFileSizeMax(mce.getMaxFileSize())` 与 `upload.setSizeMax(mce.getMaxRequestSize())`。
+这些值来自 `MultipartProperties`，被写进 `MultipartConfigElement`，再交给 Tomcat 内嵌的 fileupload——`Request#parseParts` 里就两行：`upload.setFileSizeMax(mce.getMaxFileSize())` 与 `upload.setSizeMax(mce.getMaxRequestSize())`。
 
 `StandardServletMultipartResolver` 的类注释里有一句关键的话：**这些设置在 Servlet 容器层面被应用，容器不允许从 `MultipartResolver` 层面去改。** 所以别指望用 `MultipartResolver` bean 设上限。
 
