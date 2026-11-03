@@ -60,7 +60,7 @@ location /api/upload {
 
 ### 5.3 第二道：`maxPostSize` 管的不是文件，是表单字段
 
-Tomcat Connector 上有五个数，最容易配错的是 `maxPostSize`。"上传上限调大了却没用"的故事，大多出在它身上。
+Connector 上有五个数，最容易配错的是 `maxPostSize`。"上传上限调大了却没用"的故事，大多出在它身上。
 
 | 属性 | 默认值 | 限制的是什么 |
 |:---|:---|:---|
@@ -70,7 +70,7 @@ Tomcat Connector 上有五个数，最容易配错的是 `maxPostSize`。"上传
 | `maxPartHeaderSize` | `512` | 每个 part 的头部字节上限，超出直接拒绝 |
 | `maxSwallowSize` | `2097152`（2 MiB） | 连接层"吞掉"未读请求体的上限 |
 
-`maxParameterCount` 的默认值容易对不上：`Connector` 源码注释写 10000，但 Tomcat 自带的 `server.xml` 配成 1000；**Spring Boot 内嵌容器不读 `server.xml`**，所以内嵌是 10000，外置才是 1000。
+`maxParameterCount` 容易对不上：`Connector` 源码注释写 10000，但 Tomcat 自带的 `server.xml` 配成 1000；**Spring Boot 内嵌容器不读 `server.xml`**，所以内嵌是 10000，外置才是 1000。
 
 `maxPostSize` 是最大的坑：Tomcat 文档明确说它**不是请求体总大小的通用上限**，只在 Tomcat 为解析参数而处理请求体时生效。落到 `multipart/form-data` 上，它只约束"用来生成 `getParameter()` 那批数据"，也就是普通表单字段：
 
@@ -92,15 +92,15 @@ if (part.getSubmittedFileName() == null) {          // ← 没有文件名 = 普
 
 **文件部分不算进 `maxPostSize` 的账。** 把 `server.tomcat.max-http-form-post-size` 从 2 MB 调到 50 MB，对"用户传了一个 30 MB 的文件"毫无帮助。
 
-Spring Boot 只暴露了其中两个：`server.tomcat.max-swallow-size`（2MB）对应 `AbstractHttp11Protocol#setMaxSwallowSize`，`server.tomcat.max-http-form-post-size`（2MB）对应 `Connector#setMaxPostSize`。
+Boot 只暴露了其中两个：`server.tomcat.max-swallow-size`（2MB）对应 `AbstractHttp11Protocol#setMaxSwallowSize`，`server.tomcat.max-http-form-post-size`（2MB）对应 `Connector#setMaxPostSize`。
 
-**`maxParameterCount` 和 `maxPartCount` 没有对应的 Boot 属性**，要自己加 `TomcatConnectorCustomizer`——它是 Boot 在创建内嵌 Tomcat 时留的回调接口，`factory` 是 `TomcatServletWebServerFactory`：`factory.addConnectorCustomizers(connector -> connector.setMaxPartCount(100))`，`connector` 就是那个 Connector。
+**`maxParameterCount` 和 `maxPartCount` 没有对应的 Boot 属性**，要自己加 `TomcatConnectorCustomizer`——它是 Boot 定制内嵌 Tomcat 的回调接口，`factory` 是 `TomcatServletWebServerFactory`：`factory.addConnectorCustomizers(connector -> connector.setMaxPartCount(100))`，`connector` 就是那个 Connector。
 
-调大前先算账：文档的内存估算公式是 `maxPartHeaderSize × maxPartCount × maxConnections × 2`（`maxConnections` 默认 8192），默认约 **400 MB**。文档把这列为明确的 DoS 面。
+调大前先算账。part 的头部要先进内存：每个 part 最多 `maxPartHeaderSize` 字节、单请求最多 `maxPartCount` 个 part，再乘并发连接数 `maxConnections`（默认 8192）和实现开销 ×2，默认就是 512 × 50 × 8192 × 2 ≈ **400 MB**——攻击者占满连接就能把这么多头部压进堆里，所以文档把它列为 DoS 面。
 
 ### 5.4 第三道：上限是 Spring 定的，Tomcat 只负责抛
 
-Tomcat 抛异常时，其实并不知道上限是多少——这个数不在它的配置里，是 Spring 在注册 Servlet 时交给它的。送进解析器的就是这几项：
+Tomcat 抛异常时并不知道上限是多少——这个数不在它的配置里，是 Spring 在注册 Servlet 时交给它的。送进解析器的就是这几项：
 
 ```yaml
 spring:
@@ -298,7 +298,7 @@ public class MaxUploadSizeExceededException extends MultipartException implement
 
 ### 7.1 全局 advice：让每次拒绝都留痕
 
-这份 advice 只有两个处理方法，补上的是 6.2 和 6.3 的两个缺口。
+这份 advice 只有两个方法，补的正是 6.2 和 6.3 的缺口。
 
 ```java
 @RestControllerAdvice
@@ -421,7 +421,7 @@ public class DirectUploadService {
 
 ### 9.1 三种数据路径
 
-下载篇的「五、架构层」讲的是同一个问题的镜像：
+下载篇的「五、架构层」是同一问题的镜像：
 
 | | 经应用转发（传统） | 应用流式转发 | 预签名直传 |
 |:---|:---|:---|:---|
@@ -471,7 +471,7 @@ public Map<String, Object> presign(@RequestBody PresignRequest req) {
 ### 9.4 直传的边界条件
 
 - **单次 PUT 有大小上限。** S3 单次 PUT 最大 5 GB，超过必须走分片：最多 10000 片、每片 5 MiB~5 GiB，片间可并发、合并按片号排序（完成顺序不影响结果）；分片直传还要**逐片签名**——`uploadId` 和 `partNumber` 都要进入签名。
-- **完成后必须校验一次。** 前端说"传完了"不算数——后端要用 `headObject` 确认对象确实存在、大小符合预期。
+- **完成后必须校验一次。** 后端要用 `headObject` 确认对象确实存在、大小符合预期。
 - **有效期是安全边界，而且有硬上限。** 有效期内同一 URL 可反复 PUT（覆盖语义），TTL 越长泄漏后可利用时间越久；S3 预签名有效期**不能超过 7 天**，所以 15 分钟这类短 TTL 是常规起点而不是硬性规定。
 - **内容校验只能后置。** 需要查毒 / 转码时，唯一可行的做法是"上传完成后触发异步任务，不通过就删除对象"，并把状态告诉业务方。**这一步漏掉，直传就是一个任意文件落地入口。**
 
@@ -524,7 +524,7 @@ try {
 
 ### 10.2 内容校验只能后置——这条决定你选哪条路
 
-扩展名和 `Content-Type` 都是客户端给的，`Content-Disposition` 里的 `filename` 也是。只按它们做白名单，等于让上传者自己声明"我是安全的"。真正的校验要读文件头：
+扩展名、`Content-Type`、`filename` 都是客户端给的。只按它们做白名单，等于让上传者自己声明"我是安全的"。真正的校验要读文件头：
 
 ```java
 // 魔数校验必须发生在写入最终存储之前
