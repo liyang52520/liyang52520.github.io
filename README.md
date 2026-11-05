@@ -21,14 +21,22 @@ npx hexo server    # 本地预览
 
 ### 发一篇新文章
 
+新文章先写成草稿放在 `source/_drafts/`，确认后再发布到 `source/_posts/`——只有 `_posts/` 里的文章会被构建上线：
+
 ```bash
-# 1. 新建文章（生成到 source/_posts/ 下）
-npx hexo new "文章标题"
+# 1. 新建草稿（生成到 source/_drafts/ 下）
+npx hexo new draft "文章标题"
 
-# 2. 编辑文章（Markdown + Front Matter，见下文"文章写法"）
-#    可选：npx hexo server 本地预览，确认效果后 Ctrl+C 停掉
+# 2. 编辑草稿（Markdown + Front Matter，见下文"文章写法"）
+#    可选：npx hexo server --draft 本地预览（带草稿），确认效果后 Ctrl+C 停掉
 
-# 3. 提交并推送
+# 3. 提交草稿（草稿不会上线，但会进版本库）
+git add -A
+git commit -m "草稿: 文章标题"
+git push
+
+# 4. 确认要发布时，把草稿移入 _posts/（等价于手动 git mv）
+npx hexo publish "文章标题"
 git add -A
 git commit -m "发布: 文章标题"
 git push
@@ -41,7 +49,8 @@ git push
 
 | 场景 | 操作 |
 |------|------|
-| 发新文章 | `npx hexo new "标题"` → 编辑 → `git add -A && git commit -m "..." && git push` |
+| 写新文章 | `npx hexo new draft "标题"` → 编辑 → `git add -A && git commit -m "..." && git push`（草稿不上线） |
+| 发布草稿 | `npx hexo publish "标题"` → `git add -A && git commit -m "发布: 标题" && git push` |
 | 修改文章/配置 | 直接改 → `git add -A && git commit -m "..." && git push` |
 | 只改了一部分文件 | `git add 具体文件路径` 替代 `git add -A` |
 | 内容没改，只想重新部署 | 仓库 Actions 页面 → **Run workflow**（工作流支持手动触发） |
@@ -60,8 +69,9 @@ git push (main)
 
 | 命令 | 说明 |
 |------|------|
-| `npx hexo new "标题"` | 新建文章 |
-| `npx hexo new draft "标题"` | 新建草稿 |
+| `npx hexo new draft "标题"` | ★ 新建草稿（新文章默认走这个） |
+| `npx hexo publish "标题"` | 发布草稿：把 `source/_drafts/` 里的稿子移到 `source/_posts/` |
+| `npx hexo new "标题"` | 直接新建已发布文章（会随下次 push 上线） |
 | `npx hexo new page "页面名"` | 新建独立页面 |
 | `npx hexo server` | 本地预览（默认 4000 端口） |
 | `npx hexo generate` | 生成静态文件到 `public/` |
@@ -76,7 +86,8 @@ blog/
 ├── .github/workflows/       # GitHub Actions 部署工作流（deploy.yml）
 ├── scaffolds/               # 文章模板（post / draft / page）
 ├── source/
-│   ├── _posts/              # 所有文章（Markdown）
+│   ├── _posts/              # 已发布文章（Markdown）
+│   ├── _drafts/             # 草稿箱（新文章先写在这里，不参与构建）
 │   ├── css/custom.css       # 自定义样式入口（搜索框等外观定制）
 │   ├── images/              # 图片资源
 │   └── categories/          # 分类页
@@ -85,7 +96,7 @@ blog/
 
 ## 文章写法
 
-文章位于 `source/_posts/`，使用 Markdown 编写，顶部带 Front Matter：
+文章（草稿在 `source/_drafts/`，已发布在 `source/_posts/`）使用 Markdown 编写，顶部带 Front Matter：
 
 ```yaml
 ---

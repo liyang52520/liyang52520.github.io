@@ -12,7 +12,7 @@
 - 站点：<https://liyang52520.github.io>
 - 主配置：`_config.yml`（站点信息、搜索、渲染器）
 - 主题配置：`_config.butterfly.yml`
-- 文章目录：`source/_posts/`（所有文章都在这里，Markdown 格式）
+- 文章目录：`source/_posts/`（已发布文章）+ `source/_drafts/`（草稿箱，**新文章一律先放这里**），Markdown 格式
 - 部署：推送 `main` 分支 → GitHub Actions（`.github/workflows/deploy.yml`）自动构建并发布，**不需要手动 `hexo generate` / `hexo deploy`**
 
 技术栈：
@@ -39,7 +39,8 @@
 ├── README.md                # 面向人类的使用说明
 ├── scaffolds/               # 新建文件的模板（post / draft / page）
 ├── source/
-│   ├── _posts/              # ★ 所有文章（Markdown），新增内容主要在这里
+│   ├── _posts/              # 已发布文章（push 后会生成页面）
+│   ├── _drafts/             # ★ 草稿箱：新文章先写在这里，不参与构建
 │   ├── categories/          # 分类页
 │   ├── tags/                # 标签页
 │   ├── css/custom.css       # 自定义样式入口
@@ -53,10 +54,11 @@
 ## 二、常用命令
 
 ```bash
-npx hexo new "文章标题"        # 新建文章 → source/_posts/
-npx hexo new draft "标题"      # 新建草稿
+npx hexo new draft "标题"      # ★ 新建草稿 → source/_drafts/（新文章默认走这个）
+npx hexo publish "标题"        # 草稿发布：把 source/_drafts/ 里的稿子移到 source/_posts/
+npx hexo new "文章标题"        # 直接新建已发布文章 → source/_posts/（仅用户明确要求「直接发布」时用）
 npx hexo new page "页面名"     # 新建独立页面
-npx hexo server               # 本地预览 http://localhost:4000
+npx hexo server --draft       # 本地预览（含草稿）http://localhost:4000
 npx hexo generate             # 生成静态文件到 public/
 npx hexo clean                # 清缓存（改了配置不生效时先跑这个）
 ```
@@ -72,6 +74,8 @@ npm install <包名> --cache /tmp/npm-cache-blog
 ## 三、新增一篇文章：标准流程
 
 **这是本文件最重要的一节，按顺序执行。**
+
+**新文章一律先落到 `source/_drafts/` 草稿箱**：`_config.yml` 里 `render_drafts: false`，草稿不参与构建、不会上线。用户确认后再用 `npx hexo publish "标题"` 移入 `source/_posts/`，才算真正发布。
 
 > 本节只覆盖**从零新增**。如果要改的是**已经写完的文章**（补充、优化、调整），走**第四节**——那套流程有自己的坑，不能照搬本节。
 
@@ -89,9 +93,9 @@ npm install <包名> --cache /tmp/npm-cache-blog
 
 ### 第 2 步：检索已有文章，建立关联
 
-在动笔前，先浏览 `source/_posts/` 下现有文章的**标题、标签和开头**，判断新文章与哪些已有文章属于同一知识脉络。
+在动笔前，先浏览 `source/_posts/` 和 `source/_drafts/` 下现有文章的**标题、标签和开头**，判断新文章与哪些已有文章属于同一知识脉络。
 
-当前仓库已有文章（示例，可能随时间增长）：
+当前仓库已有文章（`Welcome.md` 已发布，其余都在 `source/_drafts/` 草稿箱；示例，可能随时间增长）：
 
 - `Spring-接入点：跟着容器过一生.md` — Spring 扩展点
 - `SpringBoot的一次完整请求发生了什么？.md` — **请求链路系列导读**（原单篇 7.7 万字符，已按 6.6 拆成系列）
@@ -111,6 +115,7 @@ npm install <包名> --cache /tmp/npm-cache-blog
 - 新文章若**与某篇构成对比**（如 MVC vs WebFlux、单数据源 vs 多数据源），应主动互链。
 - 反向链接是**可选但推荐**的：若改动成本低，可以顺手在旧文章相应位置补一句指向新文章，让知识连成网。
 - **不要为了链接而链接。** 与主题无关的文章不要硬凑。
+- **引用草稿箱里的文章要交代**：被链接的文章若还没 `hexo publish`，链接会 404；交付时说明"这篇待发布后链接才生效"。
 
 内部链接写法（permalink 为 `:year/:month/:day/:title/`）：
 
@@ -123,13 +128,16 @@ npm install <包名> --cache /tmp/npm-cache-blog
 
 ### 第 3 步：创建文件
 
-推荐用命令创建，让脚手架生成正确的 Front Matter：
+新文章建在草稿箱里，让脚手架生成正确的 Front Matter：
 
 ```bash
-npx hexo new "文章标题"
+npx hexo new draft "文章标题"
 ```
 
-也可以直接在 `source/_posts/` 下新建 `.md` 文件，但**必须自己补齐 Front Matter**（见下一节）。
+会在 `source/_drafts/` 下生成 `文章标题.md`（模板来自 `scaffolds/draft.md`）。也可以直接在该目录下新建 `.md` 文件，但**必须自己补齐 Front Matter**（见下一节）。
+
+- **不要直接写进 `source/_posts/`**：那是已发布文章的目录，写进去就会随下次 push 上线。要发布时用 `npx hexo publish "文章标题"`（或 `git mv source/_drafts/文章标题.md source/_posts/`）。
+- **草稿预览**：`npx hexo server --draft`（`--draft` 是 Hexo 全局选项，带草稿一起渲染）；只想看已发布内容就用普通的 `npx hexo server` / `npx hexo generate`。
 
 ### 第 4 步：写正文
 
@@ -141,13 +149,13 @@ npx hexo new "文章标题"
 
 ### 第 6 步：说明结果与验证方式
 
-向用户交代：文件路径、标题、分类、标签、关联了哪些文章、如何本地预览。**不要擅自 `git commit` / `git push`**，除非用户明确要求。
+向用户交代：文件路径、标题、分类、标签、关联了哪些文章、如何本地预览，以及**文章现在停在 `source/_drafts/` 草稿箱、是否发布由用户决定**。**不要擅自 `git commit` / `git push` / `hexo publish`**，除非用户明确要求。
 
 ---
 
 ## 四、修改已有文章：补充 / 优化 / 调整
 
-**适用场景**：文章已经写完（甚至已经发布），用户在新一轮对话里继续提出"再补充 XX""这里讲深一点""帮我优化下结构""这段调整一下"这类要求。
+**适用场景**：文章已经写完（可能在 `source/_drafts/` 草稿箱，也可能已经发布），用户在新一轮对话里继续提出"再补充 XX""这里讲深一点""帮我优化下结构""这段调整一下"这类要求。
 
 **核心原则：修订 ≠ 追加。**
 
@@ -294,9 +302,9 @@ categories:
 
 ### 文件命名
 
-- 默认由 `hexo new` 生成：`新文章标题.md`，中文可用。
+- 默认由 `hexo new draft` 生成：`新文章标题.md`，中文可用。
 - 文件名**避免 `?`、`？`、`/`、`\`、`#`、`%` 等 URL 不安全字符**——它们会进入永久链接。历史文件里存在 `？`（如 `Nacos是怎么样和Jasypt结合的？.md`），新文件尽量不沿用这种写法。
-- 不要把 `.md` 写到 `source/` 根目录或其他位置；文章一律放 `source/_posts/`。
+- 不要把 `.md` 写到 `source/` 根目录或其他位置；**新文章先放 `source/_drafts/`，确认发布时才移到 `source/_posts/`**（`_posts/` 里的文章会随 push 自动上线）。
 
 ---
 
@@ -458,11 +466,11 @@ categories:
 **提交前怎么量**（看文件大小最省事：33 KB 以内安全，50 KB 以上必须拆）：
 
 ```bash
-# 精确字符数
-python3 -c "import re,sys;print(len(re.sub(r'\s','',open(sys.argv[1],encoding='utf-8').read())))" "source/_posts/xxx.md"
+# 精确字符数（新文章在 _drafts/，已发布的换 _posts/）
+python3 -c "import re,sys;print(len(re.sub(r'\s','',open(sys.argv[1],encoding='utf-8').read())))" "source/_drafts/xxx.md"
 
 # 或者直接看体积
-ls -lh source/_posts/xxx.md
+ls -lh source/_drafts/xxx.md
 ```
 
 **超预算怎么办：拆成系列，不要硬删内容。**
@@ -611,7 +619,7 @@ ls -lh source/_posts/xxx.md
 - 提交前自查（跳过代码围栏，输出正文中的一级标题，**无输出即为通过**）：
 
   ~~~bash
-  awk 'BEGIN{inb=0} /^```/{inb=!inb; next} inb==0 && /^# /{print FILENAME":"NR": "$0}' source/_posts/*.md
+  awk 'BEGIN{inb=0} /^```/{inb=!inb; next} inb==0 && /^# /{print FILENAME":"NR": "$0}' source/_drafts/*.md source/_posts/*.md
   ~~~
 
 ```markdown
@@ -675,7 +683,7 @@ $$
 
 **格式**
 
-- [ ] 文件位于 `source/_posts/`，扩展名 `.md`
+- [ ] 文件位于 `source/_drafts/`（草稿阶段；发布时才移入 `source/_posts/`），扩展名 `.md`
 - [ ] Front Matter 完整：`title` / `date` / `tags` / `categories`
 - [ ] `tags`、`categories` 是 YAML 列表格式，缩进正确
 - [ ] 标题含 `:`、`#` 等特殊字符时已加引号
@@ -706,7 +714,7 @@ $$
 
 **关联**
 
-- [ ] 已检索 `source/_posts/` 中的相关文章
+- [ ] 已检索 `source/_posts/` 与 `source/_drafts/` 中的相关文章
 - [ ] 有前置依赖的文章已给出链接
 - [ ] 有延续/对比关系的文章已互相指引
 - [ ] 结尾有恰当的"延伸阅读"（如果有）
@@ -722,6 +730,7 @@ $$
 - [ ] 已向用户说明文件路径、标题、分类、标签和关联情况
 - [ ] 已在**手机上**把新文章从头滚到底（不是只看电脑），见 6.6
 - [ ] 改动较大时，跑过两道独立校验：**冷读**（不知道你改了什么的读者）+ **事实核查**（逐条回源码）；两者不能合并成一遍
+- [ ] 新文章停在 `source/_drafts/`，未擅自 `hexo publish` 发布（除非用户要求）
 - [ ] 未擅自 `git commit` / `git push`（除非用户要求）
 
 ---
@@ -734,7 +743,8 @@ $$
 | 数学公式渲染错乱 | 用了 marked 而非 Pandoc；检查 `_config.yml` 的 `pandoc.args: [--mathjax]` |
 | 公式加载很慢 | MathJax 被换回 CDN 了，应为 `/js/mathjax/tex-mml-chtml.js` |
 | 改了配置不生效 | `npx hexo clean` 后重新 `generate` |
-| 文章没出现在首页 | `date` 写成了未来时间（`future: true` 时不受影响，但仍应写当前时间）；或文件不在 `source/_posts/` |
+| 文章没出现在首页 | `date` 写成了未来时间（`future: true` 时不受影响，但仍应写当前时间）；或文件不在 `source/_posts/`；或它还在 `source/_drafts/`（草稿不参与构建，见第三节） |
+| 站内互链点开是 404 | 被链接的文章还在草稿箱没发布，链接要等它 `hexo publish` 之后才有效 |
 | 标签页里文章没归类 | 标签拼写与已有标签不一致（大小写、空格差异会生成新标签） |
 | 永久链接里有奇怪字符 | 文件名含 `？` `#` `%` 等 URL 不安全字符 |
 | 页面上出现两个标题 | 正文写了 `#` 一级标题，与 Front Matter 的 `title` 重复，删掉正文的 H1 |
@@ -757,6 +767,8 @@ $$
 > **先问清楚（标题 / 分类 / 标签 / 范围），再找关联（已有文章），然后按"引子 → 问题 → 分层递进 → 收口"写；正文不写 `#` 一级标题，技术要经得起查证，语言要对读者负责。**
 >
 > **改已有文章时，当作重写整篇，不要往里塞补丁。**
+>
+> **新文章先写进 `source/_drafts/` 草稿箱，用户确认后再 `npx hexo publish` 移到 `source/_posts/`；`source/_posts/` 里的文章会随 push 上线。**
 >
 > **可读性优先于知识密度：每一节先回答「为什么要想这个问题」，章标题写论点而不是归档，删掉与主线无关的知识堆砌——堆砌知识只是把理解成本转嫁给读者，见 6.7。**
 >
